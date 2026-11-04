@@ -555,7 +555,12 @@ impl App {
                 WM_CONTEXTMENU => self.tray_menu(),
                 _ => {}
             },
-            m if m == self.taskbar_created && m != 0 => self.tray.add(),
+            m if m == self.taskbar_created && m != 0 => {
+                self.tray.add();
+                // The readout is a child of the taskbar, so it died with the old one.
+                self.overlay = None;
+                self.set_overlay(self.settings.overlay);
+            }
             _ => return None,
         }
         Some(LRESULT(0))

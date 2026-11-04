@@ -1,13 +1,21 @@
 //! Taskbar readout: a small click-to-open, never-focused layered window that
 //! sits on the empty end of the taskbar. Windows has no supported API for
-//! taskbar content (deskbands are gone in Windows 11), so this places a
-//! topmost window over the taskbar and keeps it there.
+//! taskbar content (deskbands are gone in Windows 11), so this is a child of
+//! the taskbar window. Windows lifts the taskbar into a system layer above all
+//! topmost windows while Start is open, and a child goes with it.
+//!
+//! A child shares input with its parent's thread, so a stalled window would
+//! stall the taskbar. The window therefore lives on a thread of its own, which
+//! only ever draws, and the UI thread hands it frames without waiting.
 //!
 //! It is always on, so it is drawn with plain GDI into a DIB (no Direct2D,
 //! which would keep a software rasteriser and ~19 MB resident) and the
 //! per-pixel alpha is derived from the grayscale glyph coverage.
 
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
+use std::time::Duration;
 
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
@@ -18,18 +26,19 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Registry::HKEY_CURRENT_USER;
-use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
+use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Shell::{
     ABM_GETSTATE, ABS_AUTOHIDE, APPBARDATA, QUNS_BUSY, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN,
     SHAppBarMessage, SHQueryUserNotificationState,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, EVENT_OBJECT_REORDER, FindWindowExW, FindWindowW, GW_HWNDPREV,
-    GetDesktopWindow, GetWindow, GetWindowRect, HWND_TOPMOST, IDC_ARROW, IsWindowVisible, LoadCursorW, MA_NOACTIVATE,
-    PostMessageW, RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
-    SWP_NOSIZE, SetWindowPos, ShowWindow, ULW_ALPHA, UpdateLayeredWindow, WINEVENT_OUTOFCONTEXT, WM_LBUTTONUP,
-    WM_MOUSEACTIVATE, WM_RBUTTONUP, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowExW, FindWindowW, GWL_STYLE,
+    GW_HWNDPREV, GetMessageW, GetWindow, GetWindowRect, GetWindowThreadProcessId, HWND_TOP, IDC_ARROW,
+    IsWindowVisible, LoadCursorW, MA_NOACTIVATE, MSG, PM_NOREMOVE, PeekMessageW, PostMessageW, PostThreadMessageW,
+    RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetParent, SetWindowLongW,
+    SetWindowPos, ShowWindow, ULW_ALPHA, UpdateLayeredWindow, WM_APP,
+    WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_RBUTTONUP, WNDCLASSW, WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_POPUP,
 };
 use windows::core::{PCWSTR, w};
 
@@ -44,15 +53,29 @@ const H_DIP: f32 = 36.0;
 const EDGE_DIP: f32 = 12.0;
 /// Width the Widgets button takes at the left end of a centred taskbar.
 const WIDGETS_DIP: f32 = 190.0;
+/// Posted to the readout's thread: there is a frame, or the channel closed.
+const WM_FRAME: u32 = WM_APP + 1;
 
-static OVERLAY: AtomicIsize = AtomicIsize::new(0);
-/// The main window, told about clicks. Not the readout's owner: Windows hides
-/// owned windows while their owner is minimized.
+/// The main window, told about clicks.
 static MAIN: AtomicIsize = AtomicIsize::new(0);
 
+/// The UI thread's handle on the readout.
 pub struct Overlay {
+    frames: Option<SyncSender<Frame>>,
+    /// The readout thread's id, 0 until its message queue exists.
+    thread: Arc<AtomicU32>,
+}
+
+/// Everything one redraw needs, built on the UI thread.
+struct Frame {
+    key: String,
+    runs: Vec<Run>,
+}
+
+/// The window, owned by the readout's thread.
+struct Readout {
     hwnd: HWND,
-    hook: HWINEVENTHOOK,
+    taskbar: HWND,
     surface: Option<Surface>,
     /// What is currently on screen; identical frames are not redrawn.
     shown: Option<(i32, i32, String)>,
@@ -161,6 +184,77 @@ struct Run {
 
 impl Overlay {
     pub fn create(main: HWND) -> Option<Self> {
+        MAIN.store(main.0 as isize, Ordering::Release);
+        // One slot: if the readout falls behind, frames are dropped, not queued.
+        let (frames, inbox) = sync_channel(1);
+        let thread = Arc::new(AtomicU32::new(0));
+        let id = thread.clone();
+        std::thread::Builder::new().name("readout".into()).spawn(move || run(&inbox, &id)).ok()?;
+        Some(Overlay { frames: Some(frames), thread })
+    }
+
+    /// Hands over the latest numbers. Never waits on the readout.
+    pub fn update(&mut self, snap: &Snapshot, theme: &Theme, light_taskbar: bool) {
+        let frame = Frame { key: frame_key(snap, light_taskbar), runs: runs(snap, theme, light_taskbar) };
+        if self.frames.as_ref().is_some_and(|f| f.try_send(frame).is_ok()) {
+            self.wake();
+        }
+    }
+
+    fn wake(&self) {
+        let id = self.thread.load(Ordering::SeqCst);
+        if id != 0 {
+            unsafe { PostThreadMessageW(id, WM_FRAME, WPARAM(0), LPARAM(0)) }.ok();
+        }
+    }
+}
+
+impl Drop for Overlay {
+    /// Not joined: a readout stuck on the taskbar must not take the UI with it.
+    fn drop(&mut self) {
+        self.frames = None;
+        self.wake();
+    }
+}
+
+/// The readout's thread: draws each frame it is handed until the channel closes.
+fn run(frames: &Receiver<Frame>, id: &AtomicU32) {
+    let mut msg = MSG::default();
+    // Makes the message queue, so nothing posted from here on is lost.
+    let _ = unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE) };
+    // The taskbar can refuse a new child while it is busy, or not exist yet at login.
+    let mut readout = loop {
+        if let Some(readout) = Readout::create() {
+            break readout;
+        }
+        if matches!(frames.try_recv(), Err(TryRecvError::Disconnected)) {
+            return;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    };
+    id.store(unsafe { GetCurrentThreadId() }, Ordering::SeqCst);
+    loop {
+        loop {
+            match frames.try_recv() {
+                Ok(frame) => readout.update(frame),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => return,
+            }
+        }
+        loop {
+            if unsafe { GetMessageW(&mut msg, None, 0, 0) }.0 <= 0 {
+                return;
+            }
+            if msg.message == WM_FRAME {
+                break;
+            }
+            unsafe { DispatchMessageW(&msg) };
+        }
+    }
+}
+
+impl Readout {
+    fn create() -> Option<Self> {
         unsafe {
             let instance = GetModuleHandleW(None).ok()?;
             let wc = WNDCLASSW {
@@ -171,8 +265,9 @@ impl Overlay {
                 ..Default::default()
             };
             RegisterClassW(&wc);
+            let taskbar = FindWindowW(w!("Shell_TrayWnd"), PCWSTR::null()).ok()?;
             let hwnd = CreateWindowExW(
-                WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+                WS_EX_LAYERED | WS_EX_NOACTIVATE,
                 CLASS,
                 w!("dusty readout"),
                 WS_POPUP,
@@ -186,54 +281,45 @@ impl Overlay {
                 None,
             )
             .ok()?;
-            OVERLAY.store(hwnd.0 as isize, Ordering::Release);
-            MAIN.store(main.0 as isize, Ordering::Release);
-            // Clicking the taskbar raises it above us; put the readout back on
-            // top. Focus changes can land just before that move, so watch the
-            // stacking order itself.
-            let hook = SetWinEventHook(
-                EVENT_OBJECT_REORDER,
-                EVENT_OBJECT_REORDER,
-                None,
-                Some(on_reorder),
-                0,
-                0,
-                WINEVENT_OUTOFCONTEXT,
-            );
-            Some(Overlay { hwnd, hook, surface: None, shown: None })
+            // Creating it directly under the taskbar is refused; moving it there isn't.
+            SetWindowLongW(hwnd, GWL_STYLE, WS_CHILD.0 as i32);
+            if SetParent(hwnd, Some(taskbar)).is_err() {
+                DestroyWindow(hwnd).ok();
+                return None;
+            }
+            Some(Readout { hwnd, taskbar, surface: None, shown: None })
         }
     }
 
     /// Redraws with the latest numbers, or hides when there is nowhere
     /// sensible to sit (auto-hide taskbar, fullscreen app, no taskbar).
-    pub fn update(&mut self, snap: &Snapshot, theme: &Theme, light_taskbar: bool) {
+    fn update(&mut self, frame: Frame) {
         let Some((x, y, scale)) = placement() else {
             self.hide();
             return;
         };
-        let key = (x, y, frame_key(snap, light_taskbar));
+        let key = (x, y, frame.key);
         let visible = unsafe { IsWindowVisible(self.hwnd) }.as_bool();
         if visible && self.shown.as_ref() == Some(&key) {
-            raise(self.hwnd);
             return;
         }
         if self.surface.as_ref().is_none_or(|s| s.scale != scale) {
             self.surface = Surface::new(scale);
         }
         let Some(surface) = self.surface.as_mut() else { return };
-        render(surface, &runs(snap, theme, light_taskbar));
+        render(surface, &frame.runs);
         let blend = BLENDFUNCTION {
             BlendOp: AC_SRC_OVER as u8,
             SourceConstantAlpha: 255,
             AlphaFormat: AC_SRC_ALPHA as u8,
             ..Default::default()
         };
-        let (pos, size, src) = (POINT { x, y }, SIZE { cx: surface.w, cy: surface.h }, POINT::default());
+        let (size, src) = (SIZE { cx: surface.w, cy: surface.h }, POINT::default());
         unsafe {
             UpdateLayeredWindow(
                 self.hwnd,
                 None,
-                Some(&pos),
+                None,
                 Some(&size),
                 Some(surface.dc),
                 Some(&src),
@@ -242,27 +328,24 @@ impl Overlay {
                 ULW_ALPHA,
             )
             .ok();
+            let keep = if under_taskbar_content(self.hwnd, self.taskbar) { Default::default() } else { SWP_NOZORDER };
+            SetWindowPos(self.hwnd, Some(HWND_TOP), x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE | keep).ok();
             if !visible {
                 ShowWindow(self.hwnd, SW_SHOWNOACTIVATE).ok().ok();
             }
         }
         self.shown = Some(key);
-        raise(self.hwnd);
     }
 
-    pub fn hide(&mut self) {
+    fn hide(&mut self) {
         self.shown = None;
         unsafe { ShowWindow(self.hwnd, SW_HIDE).ok().ok() };
     }
 }
 
-impl Drop for Overlay {
+impl Drop for Readout {
     fn drop(&mut self) {
-        OVERLAY.store(0, Ordering::Release);
-        unsafe {
-            UnhookWinEvent(self.hook).ok().ok();
-            DestroyWindow(self.hwnd).ok();
-        }
+        unsafe { DestroyWindow(self.hwnd) }.ok();
     }
 }
 
@@ -373,7 +456,7 @@ fn render(s: &mut Surface, runs: &[Run]) {
     }
 }
 
-/// Top-left corner in screen pixels and the taskbar's DPI scale.
+/// Top-left corner in pixels from the taskbar's corner, and the taskbar's DPI scale.
 fn placement() -> Option<(i32, i32, f32)> {
     if matches!(
         unsafe { SHQueryUserNotificationState() },
@@ -399,51 +482,37 @@ fn placement() -> Option<(i32, i32, f32)> {
     let centred = reg_dword(HKEY_CURRENT_USER, advanced, "TaskbarAl").is_none_or(|v| v != 0);
     let widgets = reg_dword(HKEY_CURRENT_USER, advanced, "TaskbarDa").is_none_or(|v| v != 0);
     let x = if centred {
-        tb.left as f32 + if widgets { WIDGETS_DIP } else { EDGE_DIP } * scale
+        (if widgets { WIDGETS_DIP } else { EDGE_DIP }) * scale
     } else {
         // Left-aligned icons: sit just before the notification area.
         let tray = unsafe { FindWindowExW(Some(taskbar), None, w!("TrayNotifyWnd"), PCWSTR::null()) }.ok()?;
         let mut tr = RECT::default();
         unsafe { GetWindowRect(tray, &mut tr) }.ok()?;
-        tr.left as f32 - w - EDGE_DIP * scale
+        (tr.left - tb.left) as f32 - w - EDGE_DIP * scale
     };
-    let y = tb.top as f32 + (th as f32 - h) / 2.0;
+    let y = (th as f32 - h) / 2.0;
     Some((x.round() as i32, y.round() as i32, scale))
 }
 
-fn raise(hwnd: HWND) {
-    unsafe {
-        SetWindowPos(hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER)
-            .ok();
-    }
-}
-
-/// Whether the taskbar sits above `hwnd`. Only the few topmost windows ahead
-/// of the readout are walked; the bound guards against the list changing mid-walk.
-fn under_taskbar(hwnd: HWND) -> bool {
-    let Ok(taskbar) = (unsafe { FindWindowW(w!("Shell_TrayWnd"), PCWSTR::null()) }) else { return false };
+/// Whether any of the taskbar's own children sit above `hwnd`. Other apps'
+/// windows on the taskbar don't count: answering those would be a fight, seen
+/// as the two taking turns on top. The bound guards against the list changing.
+fn under_taskbar_content(hwnd: HWND, taskbar: HWND) -> bool {
+    let owner = |h| {
+        let mut pid = 0;
+        unsafe { GetWindowThreadProcessId(h, Some(&mut pid)) };
+        pid
+    };
+    let shell = owner(taskbar);
     let mut above = hwnd;
     for _ in 0..256 {
         match unsafe { GetWindow(above, GW_HWNDPREV) } {
-            Ok(h) if h == taskbar => return true,
+            Ok(h) if owner(h) == shell => return true,
             Ok(h) => above = h,
             Err(_) => return false,
         }
     }
     false
-}
-
-unsafe extern "system" fn on_reorder(_: HWINEVENTHOOK, _: u32, source: HWND, _: i32, _: i32, _: u32, _: u32) {
-    let h = OVERLAY.load(Ordering::Acquire);
-    if h == 0 || source != unsafe { GetDesktopWindow() } {
-        return;
-    }
-    let hwnd = HWND(h as _);
-    // Raising is itself a reorder, so only answer the taskbar: that ends here,
-    // and never turns into a fight with another always-on-top app.
-    if unsafe { IsWindowVisible(hwnd) }.as_bool() && under_taskbar(hwnd) {
-        raise(hwnd);
-    }
 }
 
 unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
