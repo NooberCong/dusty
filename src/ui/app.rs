@@ -1101,7 +1101,10 @@ CPU {:.0}% · RAM {:.0}%{gpu}", snap.cpu, snap.mem_percent()));
         }
         self.busy = Some(phase);
         self.job_items = items.len();
-        self.error = None;
+        // The rescan after a clean mustn't wipe what the clean had to report.
+        if phase != Phase::Scan {
+            self.error = None;
+        }
         let system: Vec<&str> = items.iter().filter(|i| i.admin).map(|i| i.id).collect();
         self.quiet = delete && clean::task::covers(&system, delete);
         if matches!(phase, Phase::Clean { .. }) {
@@ -1206,7 +1209,9 @@ CPU {:.0}% · RAM {:.0}%{gpu}", snap.cpu, snap.mem_percent()));
             for e in &mut self.motion.done {
                 e.target = 0.0;
             }
-            self.error = error;
+            if phase != Some(Phase::Scan) {
+                self.error = error;
+            }
             match phase {
                 Some(Phase::Scan) => self.last_scan = Some(Instant::now()),
                 Some(Phase::Clean { from_tray }) => {
