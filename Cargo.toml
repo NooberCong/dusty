@@ -1,6 +1,6 @@
 [package]
 name = "dusty"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Tiny, honest PC cleaner and system monitor for Windows"
 license = "MIT"
