@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="284" height="56" viewBox="0 0 284 56" role="img" aria-label="Download for Windows">
+  <defs><linearGradient id="b" x1="0" y1="0" x2="0" y2="1"><stop stop-color="#FFD272"/><stop offset="1" stop-color="#E8AA46"/></linearGradient></defs>
+  <rect width="284" height="56" rx="14" fill="url(#b)"/>
+  <path fill="#2A1C06" d="M30 18.6l6.9-1v9.2H30zm8-1.1l10-1.5v10.8H38zM30 28h6.9v9.3l-6.9-1zm8 0h10v10.9l-10-1.5z"/>
+  <text x="60" y="34" fill="#2A1C06" font-family="Bahnschrift, 'Segoe UI', system-ui, -apple-system, Helvetica, Arial, sans-serif" font-size="18" font-weight="600">Download for Windows</text>
+</svg>
