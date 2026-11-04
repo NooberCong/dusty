@@ -1,7 +1,7 @@
 //! Automatic cleaning. A scheduled task starts this exe as the user, with no
 //! elevation, to clean the ticked items and exit. It never prompts: nobody may
 //! be there to answer, so without the system task its items wait for a clean
-//! started by hand.
+//! started by hand, and the log says so.
 
 use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
 use windows::Win32::System::SystemInformation::GetLocalTime;
@@ -10,12 +10,13 @@ use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToFileTime};
 use super::catalog::{Action, ITEMS, Item};
 use super::helper::Event;
 use super::volcache::ComScope;
-use super::{log, run, task};
+use super::{Outcome, log, run, task};
 use crate::settings::{Plan, Schedule, Settings, WEEKDAYS};
 use crate::win::exe_path;
 
 const TASK: &str = "dusty automatic clean";
 const TICKS_PER_DAY: u64 = 864_000_000_000;
+const OUT_OF_DATE: &str = "system cleaning needs one clean by hand after an update";
 
 /// Registers `plan`, or removes the task if it's off. None means it failed.
 pub fn set(plan: Plan) -> Option<()> {
@@ -68,6 +69,17 @@ fn items(settings: &Settings) -> Vec<&'static Item> {
     ITEMS.iter().filter(|i| settings.is_selected(i.id) && runs_unattended(i)).collect()
 }
 
+/// Logs every system item that didn't finish, so that a clean that couldn't
+/// reach them doesn't read as one that found nothing to do.
+fn log_missed(system: &[&'static Item], cleaned: &mut Vec<(&'static Item, Outcome)>, why: &str) {
+    for item in system {
+        if !cleaned.iter().any(|(done, _)| done.id == item.id) {
+            let note = Some(format!("skipped: {why}"));
+            cleaned.push((item, Outcome { failed: true, note, ..Default::default() }));
+        }
+    }
+}
+
 /// Entry point of the scheduled task.
 pub fn serve() -> i32 {
     let settings = Settings::load();
@@ -77,13 +89,24 @@ pub fn serve() -> i32 {
     let (system, own): (Vec<_>, Vec<_>) = items(&settings).into_iter().partition(|i| i.admin);
     let mut cleaned: Vec<_> = own.into_iter().map(|item| (item, run(item, true))).collect();
     let ids: Vec<&str> = system.iter().map(|i| i.id).collect();
-    if !ids.is_empty() && task::covers(&ids, true) {
+    if !ids.is_empty() {
         let mut keep = |event| {
             if let Event::Finished(item, outcome) = event {
                 cleaned.push((item, outcome));
             }
         };
-        task::run(&ids, true, &mut keep);
+        let problem = if task::covers(&ids, true) {
+            match task::run(&ids, true, &mut keep) {
+                Some(Ok(())) => None,
+                Some(Err(e)) => Some(e.to_string()),
+                None => Some("the system task didn't start".to_string()),
+            }
+        } else {
+            Some(OUT_OF_DATE.to_string())
+        };
+        if let Some(why) = problem {
+            log_missed(&system, &mut cleaned, &why);
+        }
     }
     log(&cleaned);
     0
@@ -112,6 +135,19 @@ fn task_xml(exe: &str, start: &str, repeat: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_items_that_did_not_finish_are_logged_as_missed() {
+        let find = |id| crate::clean::catalog::find(id).unwrap();
+        let (wintemp, updates) = (find("wintemp"), find("updates"));
+        let mut cleaned = vec![(wintemp, Outcome::default())];
+        log_missed(&[wintemp, updates], &mut cleaned, "no task");
+        assert_eq!(cleaned.len(), 2);
+        assert!(!cleaned[0].1.failed);
+        assert_eq!(cleaned[1].0.id, "updates");
+        assert!(cleaned[1].1.failed);
+        assert_eq!(cleaned[1].1.note.as_deref(), Some("skipped: no task"));
+    }
 
     #[test]
     fn the_start_is_always_still_to_come() {

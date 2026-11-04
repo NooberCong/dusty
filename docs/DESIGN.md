@@ -53,4 +53,12 @@ Measured on an i9-13980HX / RTX 4080 laptop (release build):
 | Previous Windows version | Deep, off | yes | handlers |
 
 Deletion never follows junctions or symlinks (the link itself is removed), skips files in
-use, and keeps each target's root folder.
+use, and keeps each target's root folder. Below a target's root everything is opened
+relative to its parent folder's handle, never by path, so a folder swapped for a junction
+mid-clean can't redirect the elevated task. It finds Windows' folders through the system
+rather than `%SystemRoot%`, because it inherits the user's environment.
+
+The task runs one clean at a time. A request made while it's busy is refused with an error,
+and a running clean is never stopped. An automatic clean that can't reach its system items,
+because the Program Files copy is out of date or the task is busy, logs each one as skipped.
+A clean by hand updates the copy.
