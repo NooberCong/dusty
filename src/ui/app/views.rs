@@ -60,6 +60,18 @@ fn alert(s: &Snapshot) -> Option<(String, Level)> {
     None
 }
 
+/// Name and explanation of each temperature sensor, for when it stays silent.
+const SENSORS: [(&str, &str); 3] = [
+    ("CPU", "Not reported by this PC"),
+    ("GPU", "No reading from the graphics driver, the GPU may be asleep"),
+    ("Drives", "Not reported by the drive"),
+];
+
+/// Which of `SENSORS` have a reading now. A PC with no GPU has nothing to miss.
+pub(super) fn sensor_readings(s: &Snapshot) -> [bool; 3] {
+    [s.cpu_temp.is_some(), s.gpu.as_ref().is_none_or(|g| g.temp.is_some()), s.disk_temp.is_some()]
+}
+
 /// The toothed gauge: a minute track whose ticks light up to `value`, the
 /// leading tick fading in so the fill moves continuously.
 fn dial(c: &Canvas, t: &Theme, center: (f32, f32), r: f32, value: f32, color: Rgba) {
@@ -540,17 +552,44 @@ impl App {
 
     // ---- Settings view ----------------------------------------------------
 
+    /// A row with a picker on its right: the brass pill slides to the choice.
+    fn draw_theme_row(&mut self, c: &Canvas, res: &Res, r: R) {
+        const SEGMENT_W: f32 = 68.0;
+        const TRACK_H: f32 = 32.0;
+        let t = self.theme;
+        let f = &res.fonts;
+        c.line(r.x + 12.0, r.bottom() - 0.5, r.right() - 12.0, r.bottom() - 0.5, t.stroke.alpha(0.6), 1.0);
+        c.text("Theme", &f.body, R::new(r.x + 12.0, r.y + 13.0, r.w - 260.0, 20.0), t.text);
+        c.text("System follows your Windows setting", &f.cap, R::new(r.x + 12.0, r.y + 34.0, r.w - 260.0, 18.0), t.text2);
+
+        let track = R::new(r.right() - 12.0 - 3.0 * SEGMENT_W, r.y + (r.h - TRACK_H) / 2.0, 3.0 * SEGMENT_W, TRACK_H);
+        c.fill(track, 9.0, t.surface);
+        let pick = self.motion.theme_pick.value;
+        let segment = |i: f32| R::new(track.x + i * SEGMENT_W, track.y, SEGMENT_W, TRACK_H);
+        c.fill(segment(pick).inset(3.0, 3.0), 6.5, t.accent);
+        for (i, (mode, label)) in ThemeMode::ALL.into_iter().enumerate() {
+            let hit = Hit::Theme(mode);
+            let chosen = (1.0 - (pick - i as f32).abs()).clamp(0.0, 1.0);
+            let ink = t.text2.mix(t.text, self.hover(hit)).mix(t.on_accent, chosen);
+            c.text(label, &f.cap_c, segment(i as f32), ink);
+            self.hits.push((segment(i as f32), hit));
+        }
+    }
+
     fn draw_settings(&mut self, c: &Canvas, res: &Res, w: f32) {
         let t = self.theme;
         let f = &res.fonts;
         let (x0, cw) = (SIDE + PAD, w - SIDE - 2.0 * PAD);
         self.title(c, res, "Settings");
 
+        let mut y = 72.0;
+        self.draw_theme_row(c, res, R::new(x0 - 12.0, y, cw + 24.0, SETTING_H));
+        y += SETTING_H;
+
         let rows = [
             (Hit::Overlay, "Taskbar readout", "Load and temperatures next to the Start button"),
             (Hit::Autostart, "Start with Windows", "Opens quietly in the notification area"),
         ];
-        let mut y = 72.0;
         for (i, (hit, title, desc)) in rows.into_iter().enumerate() {
             let r = R::new(x0 - 12.0, y, cw + 24.0, SETTING_H);
             let hover = self.hover(hit);
@@ -565,21 +604,19 @@ impl App {
             y += SETTING_H;
         }
 
-        y += 26.0;
-        c.text("Temperature sensors", &f.cap_b, R::new(x0, y, 300.0, 20.0), t.text);
-        y += 30.0;
-        let snap = &self.snap;
-        let gpu_temp = snap.gpu.as_ref().and_then(|g| g.temp).is_some();
-        let lines = [
-            ("CPU", snap.cpu_temp.is_some(), "Reported by the firmware", "Not reported by this PC"),
-            ("GPU", gpu_temp, "Reported by the graphics driver", "Not reported by the graphics driver"),
-            ("Drives", snap.disk_temp.is_some(), "Reported by the drive", "Not reported by the drive"),
-        ];
-        for (name, ok, yes, no) in lines {
-            c.circle(x0 + 4.0, y + 11.0, 3.5, if ok { t.good } else { t.text3 });
-            c.text(name, &f.body, R::new(x0 + 18.0, y, 80.0, 22.0), t.text);
-            c.text(if ok { yes } else { no }, &f.cap, R::new(x0 + 96.0, y, cw - 96.0, 22.0), t.text2);
+        // Sensors only come up when one has never answered. A reading since
+        // start proves it works, even if a sleeping GPU has gone quiet now.
+        let silent: Vec<_> = SENSORS.iter().zip(self.sensors_seen).filter(|(_, seen)| self.ready && !seen).collect();
+        if !silent.is_empty() {
+            y += 26.0;
+            c.text("Missing temperatures", &f.cap_b, R::new(x0, y, 300.0, 20.0), t.text);
             y += 30.0;
+            for ((name, why), _) in silent {
+                c.circle(x0 + 4.0, y + 11.0, 3.5, t.warn);
+                c.text(name, &f.body, R::new(x0 + 18.0, y, 80.0, 22.0), t.text);
+                c.text(why, &f.cap, R::new(x0 + 96.0, y, cw - 96.0, 22.0), t.text2);
+                y += 30.0;
+            }
         }
 
         y += 22.0;
@@ -595,11 +632,28 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::{Level, alert};
+    use super::super::Hit;
+    use super::{Level, alert, sensor_readings};
     use crate::monitor::{GpuStat, Snapshot, Volume};
 
     fn calm() -> Snapshot {
         Snapshot { cpu: 10.0, mem_used: 4, mem_total: 16, ..Default::default() }
+    }
+
+    #[test]
+    fn the_pointer_shows_only_where_a_click_does_something() {
+        assert!(Hit::Close.clickable(false));
+        assert!(Hit::Row(0).clickable(false));
+        assert!(!Hit::Row(0).clickable(true));
+        assert!(!Hit::Chart.clickable(false));
+    }
+
+    #[test]
+    fn only_a_gpu_that_exists_can_miss_a_temperature() {
+        let mut s = calm();
+        assert_eq!(sensor_readings(&s), [false, true, false]);
+        s.gpu = Some(GpuStat::default());
+        assert_eq!(sensor_readings(&s), [false, false, false]);
     }
 
     #[test]

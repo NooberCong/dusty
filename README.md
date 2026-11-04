@@ -5,6 +5,7 @@ A tiny, honest PC cleaner and system monitor for Windows 10/11.
 - **Monitor**: CPU, memory, disk and GPU load on a dial with 60-second history, GPU and
   drive temperatures, CPU temperature on ASUS laptops, installed memory type and speed,
   free space per drive. It only speaks up when something needs attention.
+- **Theme**: follows Windows, or pick Light or Dark in Settings.
 - **Taskbar readout**: load and temperatures on the empty end of the taskbar.
   Click it to open dusty; right-click it for the menu.
 - **Clean**: one-click *Quick* items (no admin) and configurable *Deep* items. System

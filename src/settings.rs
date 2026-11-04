@@ -12,9 +12,29 @@ use windows::core::{PCWSTR, w};
 use crate::clean::ITEMS;
 use crate::win::{env_path, exe_path, wide};
 
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub enum ThemeMode {
+    /// Follows the Windows app theme.
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+impl ThemeMode {
+    /// In display order. The labels are also how the file spells them.
+    pub const ALL: [(ThemeMode, &str); 3] =
+        [(ThemeMode::System, "System"), (ThemeMode::Light, "Light"), (ThemeMode::Dark, "Dark")];
+
+    pub fn index(self) -> usize {
+        Self::ALL.iter().position(|(m, _)| *m == self).unwrap_or(0)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Settings {
     pub overlay: bool,
+    pub theme: ThemeMode,
     /// Ids of the cleanup items the user has ticked.
     pub selected: Vec<String>,
 }
@@ -23,6 +43,7 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             overlay: true,
+            theme: ThemeMode::default(),
             selected: ITEMS.iter().filter(|i| i.default_on).map(|i| i.id.to_string()).collect(),
         }
     }
@@ -44,6 +65,7 @@ impl Settings {
             let Some((k, v)) = line.split_once('=') else { continue };
             match k.trim() {
                 "overlay" => s.overlay = v.trim() == "1",
+                "theme" => s.theme = ThemeMode::ALL.iter().find(|(_, l)| *l == v.trim()).map_or(s.theme, |(m, _)| *m),
                 "selected" => {
                     s.selected = v
                         .split(',')
@@ -59,7 +81,8 @@ impl Settings {
     }
 
     fn serialize(&self) -> String {
-        format!("overlay={}\nselected={}\n", self.overlay as u8, self.selected.join(","))
+        let theme = ThemeMode::ALL[self.theme.index()].1;
+        format!("overlay={}\ntheme={theme}\nselected={}\n", self.overlay as u8, self.selected.join(","))
     }
 
     pub fn save(&self) {
@@ -122,11 +145,17 @@ mod tests {
 
     #[test]
     fn roundtrip_and_unknown_ids_dropped() {
-        let s = Settings { overlay: false, selected: vec!["temp".into(), "dev".into()] };
+        let s = Settings { overlay: false, theme: ThemeMode::Dark, selected: vec!["temp".into(), "dev".into()] };
         assert_eq!(Settings::parse(&s.serialize()), s);
         let p = Settings::parse("overlay=1\nselected=temp, bogus ,recycle\n");
         assert_eq!(p.selected, vec!["temp", "recycle"]);
         assert!(p.overlay);
+    }
+
+    #[test]
+    fn an_unknown_theme_falls_back_to_system() {
+        assert_eq!(Settings::parse("theme=Light\n").theme, ThemeMode::Light);
+        assert_eq!(Settings::parse("theme=neon\n").theme, ThemeMode::System);
     }
 
     #[test]

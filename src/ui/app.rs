@@ -25,15 +25,15 @@ use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_CONTROL};
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, GWLP_USERDATA, GetClientRect, GetForegroundWindow, GetSystemMetrics, GetWindowLongPtrW,
+    CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, GWLP_USERDATA, GetClientRect, GetCursorPos, GetForegroundWindow, GetSystemMetrics, GetWindowLongPtrW,
     HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT,
-    IDC_ARROW, IsIconic, IsWindowVisible, LoadCursorW, LoadIconW, MINMAXINFO, PostMessageW, PostQuitMessage,
+    IDC_ARROW, IDC_HAND, IsIconic, IsWindowVisible, LoadCursorW, LoadIconW, MINMAXINFO, PostMessageW, PostQuitMessage,
     RegisterClassW, RegisterWindowMessageW, SC_MINIMIZE, SM_CXSCREEN, SM_CYSCREEN, SPI_GETCLIENTAREAANIMATION,
     SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_NOZORDER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
+    SWP_NOZORDER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetCursor, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
     ShowWindow, SystemParametersInfoW, WM_ACTIVATEAPP, WM_CLOSE, WM_CONTEXTMENU, WM_DPICHANGED, WM_ERASEBKGND,
     WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE,
-    WM_NCHITTEST, WM_PAINT, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOMMAND, WNDCLASSW, WS_MAXIMIZEBOX,
+    WM_NCHITTEST, WM_PAINT, WM_SETCURSOR, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCOMMAND, WNDCLASSW, WS_MAXIMIZEBOX,
     WS_OVERLAPPEDWINDOW,
 };
 use windows::core::{PCWSTR, w};
@@ -43,11 +43,11 @@ use super::gfx::{CENTER, Canvas, Gfx, LEADING, NORMAL, R, SEMIBOLD, TRAILING};
 use super::logo::{Logo, TOOTH_DEG};
 use super::overlay::Overlay;
 use super::theme::{Rgba, Theme};
-use super::tray::{MenuChoice, Tray};
+use super::tray::{self, MenuChoice, Tray};
 use super::{WM_APP_JOB, WM_APP_MENU, WM_APP_SAMPLE, WM_APP_SHOW, WM_APP_TICK, WM_APP_TRAY};
 use crate::clean::{self, ITEMS, Item, Outcome, Tier, helper};
 use crate::monitor::{HISTORY_LEN, History, Monitor, Snapshot};
-use crate::settings::{self, Settings};
+use crate::settings::{self, Settings, ThemeMode};
 use crate::win::{env_path, fmt_bytes, is_elevated, system_uses_light_theme, wide};
 
 mod views;
@@ -98,7 +98,20 @@ enum Hit {
     Row(usize),
     Overlay,
     Autostart,
+    Theme(ThemeMode),
     OpenLog,
+}
+
+impl Hit {
+    /// Whether a click here does anything. The chart only reads out values,
+    /// and the cleanup list is locked while a job runs.
+    fn clickable(self, busy: bool) -> bool {
+        match self {
+            Hit::Chart => false,
+            Hit::Row(_) => !busy,
+            _ => true,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -206,6 +219,10 @@ struct Motion {
     scroll: Spring,
     checks: Vec<Ease>,
     toggles: [Ease; 2],
+    /// Position of the theme picker's selection, in segments.
+    theme_pick: Ease,
+    /// 0 to 1 as the colours fade to a new theme.
+    theme_fade: Ease,
     hover: Vec<(Hit, Ease)>,
 }
 
@@ -214,7 +231,10 @@ pub struct App {
     /// Direct2D resources exist only while the window is shown.
     res: Option<Res>,
     rt: Option<ID2D1HwndRenderTarget>,
+    /// The colours on screen, which differ from `theme_to` only during a fade.
     theme: Theme,
+    theme_from: Theme,
+    theme_to: Theme,
     light_taskbar: bool,
     scale: f32,
     tab: Tab,
@@ -230,6 +250,8 @@ pub struct App {
     snap: Snapshot,
     hist: History,
     ready: bool,
+    /// Which temperature sensors have given a reading since dusty started.
+    sensors_seen: [bool; 3],
     mouse: (f32, f32),
     hits: Vec<(R, Hit)>,
     hover: Option<Hit>,
@@ -280,6 +302,8 @@ pub fn create(hidden: bool) -> windows::core::Result<HWND> {
         )?
     };
     let settings = Settings::load();
+    tray::set_menu_theme(settings.theme);
+    let theme = Theme::resolve(settings.theme);
     let rows: Vec<Row> = ITEMS
         .iter()
         .map(|item| Row { item, checked: settings.is_selected(item.id), size: None, pending: false })
@@ -302,6 +326,8 @@ pub fn create(hidden: bool) -> windows::core::Result<HWND> {
         scroll: Spring::default(),
         checks: rows.iter().map(|r| Ease::new(r.checked as u8 as f32)).collect(),
         toggles: [Ease::new(settings.overlay as u8 as f32), Ease::new(autostart as u8 as f32)],
+        theme_pick: Ease::new(settings.theme.index() as f32),
+        theme_fade: Ease::new(1.0),
         hover: Vec::new(),
     };
     let app = App {
@@ -309,7 +335,9 @@ pub fn create(hidden: bool) -> windows::core::Result<HWND> {
         overlay: None,
         res: None,
         rt: None,
-        theme: Theme::current(),
+        theme,
+        theme_from: theme,
+        theme_to: theme,
         light_taskbar: system_uses_light_theme(),
         scale: unsafe { GetDpiForWindow(hwnd) } as f32 / 96.0,
         tab: Tab::Monitor,
@@ -322,6 +350,7 @@ pub fn create(hidden: bool) -> windows::core::Result<HWND> {
         snap: Snapshot::default(),
         hist: History::default(),
         ready: false,
+        sensors_seen: [false; 3],
         mouse: (0.0, 0.0),
         hits: Vec::new(),
         hover: None,
@@ -442,11 +471,19 @@ impl App {
                 self.invalidate();
             }
             WM_SETTINGCHANGE => {
-                self.theme = Theme::current();
+                self.set_theme(Theme::resolve(self.settings.theme));
                 self.light_taskbar = system_uses_light_theme();
                 self.animate = animations_enabled();
-                self.apply_frame_theme();
                 self.invalidate();
+            }
+            WM_SETCURSOR if lo(lp) as u32 == HTCLIENT => {
+                let mut p = POINT::default();
+                unsafe {
+                    GetCursorPos(&mut p).ok();
+                    ScreenToClient(self.hwnd, &mut p).ok().ok();
+                }
+                self.set_cursor(self.hit_at(p.x as f32, p.y as f32));
+                return Some(LRESULT(1));
             }
             WM_MOUSEMOVE => self.mouse_move(lo(lp) as f32, hi(lp) as f32),
             WM_MOUSELEAVE => {
@@ -509,8 +546,8 @@ impl App {
     }
 
     fn apply_frame_theme(&self) {
-        let dark: i32 = self.theme.dark.into();
-        let edge = self.theme.stroke;
+        let dark: i32 = self.theme_to.dark.into();
+        let edge = self.theme_to.stroke;
         // COLORREF 0x00BBGGRR.
         let border = ((edge.2 * 255.0) as u32) << 16 | ((edge.1 * 255.0) as u32) << 8 | (edge.0 * 255.0) as u32;
         let corners = DWMWCP_ROUND;
@@ -521,6 +558,23 @@ impl App {
             DwmSetWindowAttribute(self.hwnd, DWMWA_BORDER_COLOR, &border as *const _ as _, 4).ok();
             DwmSetWindowAttribute(self.hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &corners as *const _ as _, 4).ok();
             DwmExtendFrameIntoClientArea(self.hwnd, &margins).ok();
+        }
+    }
+
+    /// Fades to `to`, or just switches if nobody can see it.
+    fn set_theme(&mut self, to: Theme) {
+        if to == self.theme_to {
+            return;
+        }
+        self.theme_from = self.theme;
+        self.theme_to = to;
+        self.apply_frame_theme();
+        if self.visible() {
+            self.motion.theme_fade = Ease { value: 0.0, target: 1.0 };
+            self.kick();
+        } else {
+            self.theme = to;
+            self.motion.theme_fade.snap(1.0);
         }
     }
 
@@ -622,6 +676,21 @@ impl App {
         }
     }
 
+    fn set_cursor(&self, hit: Option<Hit>) {
+        let pointer = hit.is_some_and(|h| h.clickable(self.busy.is_some()));
+        let cursor = unsafe { LoadCursorW(None, if pointer { IDC_HAND } else { IDC_ARROW }) };
+        unsafe { SetCursor(cursor.ok()) };
+    }
+
+    /// A frame can move things under a still mouse: a scroll, a new view, a
+    /// job starting. Windows only asks about the cursor when the mouse moves.
+    fn refresh_hover(&mut self) {
+        if self.tracking_leave {
+            self.set_hover(self.hit_at(self.mouse.0 * self.scale, self.mouse.1 * self.scale));
+            self.set_cursor(self.hover);
+        }
+    }
+
     fn set_hover(&mut self, h: Option<Hit>) {
         if self.hover == h {
             return;
@@ -687,6 +756,13 @@ impl App {
                 settings::set_autostart(!self.autostart);
                 self.autostart = settings::autostart_enabled();
                 self.motion.toggles[1].target = self.autostart as u8 as f32;
+            }
+            Hit::Theme(mode) if mode != self.settings.theme => {
+                self.settings.theme = mode;
+                self.settings.save();
+                self.motion.theme_pick.target = mode.index() as f32;
+                tray::set_menu_theme(mode);
+                self.set_theme(Theme::resolve(mode));
             }
             Hit::OpenLog => {
                 if let Some(dir) = env_path("LOCALAPPDATA").map(|l| l.join("dusty")) {
@@ -776,6 +852,11 @@ CPU {:.0}% · RAM {:.0}%{gpu}", snap.cpu, snap.mem_percent()));
         self.hist = st.history.clone();
         self.ready = st.ready;
         drop(st);
+        if self.ready {
+            for (seen, now) in self.sensors_seen.iter_mut().zip(views::sensor_readings(&self.snap)) {
+                *seen |= now;
+            }
+        }
         if let Some(o) = &mut self.overlay {
             o.update(&self.snap, &self.theme, self.light_taskbar);
         }
@@ -885,6 +966,9 @@ CPU {:.0}% · RAM {:.0}%{gpu}", snap.cpu, snap.mem_percent()));
         for e in m.checks.iter_mut().chain(m.toggles.iter_mut()) {
             fine |= e.step(dt, 0.05, 0.004);
         }
+        fine |= m.theme_pick.step(dt, 0.05, 0.003);
+        fine |= m.theme_fade.step(dt, 0.07, 0.004);
+        self.theme = self.theme_from.mix(self.theme_to, m.theme_fade.value);
         for (_, e) in m.hover.iter_mut() {
             fine |= e.step(dt, 0.05, 0.004);
         }
@@ -1095,6 +1179,7 @@ CPU {:.0}% · RAM {:.0}%{gpu}", snap.cpu, snap.mem_percent()));
             }
         }
         unsafe { EndPaint(self.hwnd, &ps).ok().ok() };
+        self.refresh_hover();
     }
 
     fn create_target(&self) -> Option<ID2D1HwndRenderTarget> {

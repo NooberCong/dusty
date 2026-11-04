@@ -14,6 +14,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{PCSTR, PCWSTR, w};
 
 use super::WM_APP_TRAY;
+use crate::settings::ThemeMode;
 
 pub struct Tray {
     data: NOTIFYICONDATAW,
@@ -115,15 +116,20 @@ impl Drop for Tray {
     }
 }
 
-/// Lets classic popup menus follow the dark theme. These uxtheme exports
+/// Makes classic popup menus match the app's theme. These uxtheme exports
 /// (ordinals 135/136) are undocumented but stable since Windows 10 1903;
 /// if they are missing nothing happens and menus stay light.
-pub fn allow_dark_menus() {
+pub fn set_menu_theme(mode: ThemeMode) {
     unsafe {
         let Ok(ux) = LoadLibraryW(w!("uxtheme.dll")) else { return };
         if let Some(set_mode) = GetProcAddress(ux, PCSTR(135 as _)) {
             let set_mode: extern "system" fn(i32) -> i32 = std::mem::transmute(set_mode);
-            set_mode(1); // AllowDark: follow the system app theme.
+            // PreferredAppMode: AllowDark follows the system.
+            set_mode(match mode {
+                ThemeMode::System => 1,
+                ThemeMode::Dark => 2,
+                ThemeMode::Light => 3,
+            });
         }
         if let Some(flush) = GetProcAddress(ux, PCSTR(136 as _)) {
             let flush: extern "system" fn() = std::mem::transmute(flush);

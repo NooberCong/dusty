@@ -33,7 +33,6 @@ pub fn run(start_hidden: bool) -> i32 {
         }
         return 0;
     }
-    tray::allow_dark_menus();
     if app::create(start_hidden).is_err() {
         return 1;
     }

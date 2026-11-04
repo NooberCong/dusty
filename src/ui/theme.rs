@@ -1,5 +1,6 @@
-//! Brass on deep petrol, in the Windows app theme's dark or light form.
+//! Brass on deep petrol, in dark and light forms.
 
+use crate::settings::ThemeMode;
 use crate::win::apps_use_light_theme;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -41,13 +42,34 @@ pub struct Theme {
 }
 
 impl Theme {
-    pub fn current() -> Self {
-        // Debug builds can force a theme to check it without touching Windows' setting.
-        #[cfg(debug_assertions)]
-        if let Ok(forced) = std::env::var("DUSTY_THEME") {
-            return if forced == "light" { Self::light() } else { Self::dark() };
+    pub fn resolve(mode: ThemeMode) -> Self {
+        let light = match mode {
+            ThemeMode::System => apps_use_light_theme(),
+            ThemeMode::Light => true,
+            ThemeMode::Dark => false,
+        };
+        if light { Self::light() } else { Self::dark() }
+    }
+
+    /// Part way from this theme to `o`, for fading between them.
+    pub fn mix(self, o: Theme, t: f32) -> Self {
+        let m = |a: Rgba, b: Rgba| a.mix(b, t);
+        Theme {
+            dark: o.dark,
+            bg: m(self.bg, o.bg),
+            sidebar: m(self.sidebar, o.sidebar),
+            surface: m(self.surface, o.surface),
+            stroke: m(self.stroke, o.stroke),
+            text: m(self.text, o.text),
+            text2: m(self.text2, o.text2),
+            text3: m(self.text3, o.text3),
+            accent: m(self.accent, o.accent),
+            accent_hi: m(self.accent_hi, o.accent_hi),
+            on_accent: m(self.on_accent, o.on_accent),
+            good: m(self.good, o.good),
+            warn: m(self.warn, o.warn),
+            crit: m(self.crit, o.crit),
         }
-        if apps_use_light_theme() { Self::light() } else { Self::dark() }
     }
 
     fn dark() -> Self {
@@ -96,5 +118,16 @@ impl Theme {
     /// Normal / warning / critical colour for a temperature in °C.
     pub fn temp(&self, c: f32, base: Rgba) -> Rgba {
         if c >= 95.0 { self.crit } else if c >= 85.0 { self.warn } else { base }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Theme, ThemeMode};
+
+    #[test]
+    fn explicit_modes_ignore_windows() {
+        assert!(!Theme::resolve(ThemeMode::Light).dark);
+        assert!(Theme::resolve(ThemeMode::Dark).dark);
     }
 }
