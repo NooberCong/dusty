@@ -47,8 +47,8 @@ use super::tray::{self, MenuChoice, Tray};
 use super::{WM_APP_JOB, WM_APP_MENU, WM_APP_SAMPLE, WM_APP_SHOW, WM_APP_TICK, WM_APP_TRAY};
 use crate::clean::{self, ITEMS, Item, Outcome, Tier, helper};
 use crate::monitor::{HISTORY_LEN, History, Monitor, Snapshot};
-use crate::settings::{self, Settings, ThemeMode};
-use crate::win::{env_path, fmt_bytes, is_elevated, system_uses_light_theme, wide};
+use crate::settings::{self, Plan, Schedule, Settings, ThemeMode};
+use crate::win::{env_path, fmt_bytes, fmt_hour, is_elevated, system_uses_light_theme, wide};
 
 mod views;
 
@@ -99,6 +99,11 @@ enum Hit {
     Row(usize),
     Overlay,
     Autostart,
+    Schedule(Schedule),
+    /// Moves the day of automatic cleaning, back or forward.
+    ScheduleDay(i8),
+    /// Moves its hour, back or forward.
+    ScheduleHour(i8),
     Theme(ThemeMode),
     OpenLog,
 }
@@ -229,6 +234,9 @@ struct Motion {
     toggles: [Ease; 2],
     /// Position of the theme picker's selection, in segments.
     theme_pick: Ease,
+    schedule_pick: Ease,
+    /// The row that sets when it runs, shown unless it's off.
+    schedule_open: Ease,
     /// 0 to 1 as the colours fade to a new theme.
     theme_fade: Ease,
     hover: Vec<(Hit, Ease)>,
@@ -270,6 +278,8 @@ pub struct App {
     tray: Tray,
     settings: Settings,
     autostart: bool,
+    /// This clean's system items go through the scheduled task, with no prompt.
+    quiet: bool,
     elevated: bool,
     rows: Vec<Row>,
     busy: Option<Phase>,
@@ -342,6 +352,8 @@ pub fn create(hidden: bool) -> windows::core::Result<HWND> {
         step_on: Ease::new(0.0),
         toggles: [Ease::new(settings.overlay as u8 as f32), Ease::new(autostart as u8 as f32)],
         theme_pick: Ease::new(settings.theme.index() as f32),
+        schedule_pick: Ease::new(settings.plan.every.index() as f32),
+        schedule_open: Ease::new((settings.plan.every != Schedule::Off) as u8 as f32),
         theme_fade: Ease::new(1.0),
         hover: Vec::new(),
     };
@@ -374,6 +386,7 @@ pub fn create(hidden: bool) -> windows::core::Result<HWND> {
         monitor: Monitor::start(hwnd, WM_APP_SAMPLE),
         tray: Tray::new(hwnd),
         autostart,
+        quiet: false,
         settings,
         elevated: is_elevated(),
         rows,
@@ -775,6 +788,9 @@ impl App {
                 self.autostart = settings::autostart_enabled();
                 self.motion.toggles[1].target = self.autostart as u8 as f32;
             }
+            Hit::Schedule(every) if every != self.settings.plan.every => self.set_plan(Plan { every, ..self.settings.plan }),
+            Hit::ScheduleDay(by) => self.set_plan(self.settings.plan.step_day(by)),
+            Hit::ScheduleHour(by) => self.set_plan(self.settings.plan.step_hour(by)),
             Hit::Theme(mode) if mode != self.settings.theme => {
                 self.settings.theme = mode;
                 self.settings.save();
@@ -795,6 +811,29 @@ impl App {
         }
         self.retarget();
         self.invalidate();
+    }
+
+    /// The controls only move once the task is registered. Turning it on gives
+    /// ticked system items their one prompt, while someone is here to answer.
+    fn set_plan(&mut self, plan: Plan) {
+        // COM gets a thread of its own, away from the window's.
+        let registered = std::thread::spawn(move || clean::schedule::set(plan)).join();
+        if !registered.is_ok_and(|r| r.is_some()) {
+            return;
+        }
+        let turned_on = self.settings.plan.every == Schedule::Off && plan.every != Schedule::Off;
+        self.settings.plan = plan;
+        self.settings.save();
+        self.motion.schedule_pick.target = plan.every.index() as f32;
+        self.motion.schedule_open.target = (plan.every != Schedule::Off) as u8 as f32;
+        let ids: Vec<&str> = self.rows.iter().filter(|r| r.checked && r.item.admin && r.item.default_on).map(|r| r.item.id).collect();
+        if turned_on && !ids.is_empty() && !self.elevated {
+            std::thread::spawn(move || {
+                if !clean::task::covers(&ids, true) {
+                    helper::install_task().ok();
+                }
+            });
+        }
     }
 
     fn set_tab(&mut self, tab: Tab) {
@@ -990,6 +1029,8 @@ CPU {:.0}% · RAM {:.0}%{gpu}", snap.cpu, snap.mem_percent()));
             fine |= e.step(dt, 0.05, 0.004);
         }
         fine |= m.theme_pick.step(dt, 0.05, 0.003);
+        fine |= m.schedule_pick.step(dt, 0.05, 0.003);
+        fine |= m.schedule_open.step(dt, 0.05, 0.003);
         fine |= m.theme_fade.step(dt, 0.07, 0.004);
         self.theme = self.theme_from.mix(self.theme_to, m.theme_fade.value);
         for (_, e) in m.hover.iter_mut() {
@@ -1061,6 +1102,8 @@ CPU {:.0}% · RAM {:.0}%{gpu}", snap.cpu, snap.mem_percent()));
         self.busy = Some(phase);
         self.job_items = items.len();
         self.error = None;
+        let system: Vec<&str> = items.iter().filter(|i| i.admin).map(|i| i.id).collect();
+        self.quiet = delete && clean::task::covers(&system, delete);
         if matches!(phase, Phase::Clean { .. }) {
             self.follow_step = true;
             for e in &mut self.motion.done {
@@ -1089,16 +1132,18 @@ CPU {:.0}% · RAM {:.0}%{gpu}", snap.cpu, snap.mem_percent()));
                 tx.send(JobMsg::Item(item, o)).ok();
                 post();
             }
-            if delete {
-                clean::log(&cleaned);
-            }
             let mut error = None;
             if !admin.is_empty() {
                 let ids: Vec<&str> = admin.iter().map(|i| i.id).collect();
                 let report = |event| {
                     tx.send(match event {
                         helper::Event::Started(item) => JobMsg::Started(item),
-                        helper::Event::Finished(item, o) => JobMsg::Item(item, o),
+                        helper::Event::Finished(item, o) => {
+                            if delete {
+                                cleaned.push((item, o.clone()));
+                            }
+                            JobMsg::Item(item, o)
+                        }
                     })
                     .ok();
                     post();
@@ -1110,6 +1155,9 @@ CPU {:.0}% · RAM {:.0}%{gpu}", snap.cpu, snap.mem_percent()));
                     }
                     Err(e) => error = Some(format!("System items could not be processed: {e}")),
                 }
+            }
+            if delete {
+                clean::log(&cleaned);
             }
             tx.send(JobMsg::Done { error }).ok();
             post();

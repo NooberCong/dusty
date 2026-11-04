@@ -5,6 +5,12 @@ A tiny, honest PC cleaner and system monitor for Windows 10/11.
 - **Monitor**: CPU, memory, disk and GPU load on a dial with 60-second history, GPU and
   drive temperatures, CPU temperature on ASUS laptops, installed memory type and speed,
   free space per drive. It only speaks up when something needs attention.
+- **One prompt**: the first system clean asks for administrator permission, and later ones
+  don't. That prompt installs a copy of dusty in Program Files and a scheduled task that
+  runs it. A new build asks once more, and "Previous Windows version" always asks.
+- **Automatic cleaning**: daily, weekly or monthly, on the day and hour you pick in
+  Settings. It cleans your ticked items, or does so once the PC is back on if it was off,
+  and never empties the Recycle Bin.
 - **Theme**: follows Windows, or pick Light or Dark in Settings.
 - **Taskbar readout**: load and temperatures on the empty end of the taskbar.
   Click it to open dusty; right-click it for the menu.
@@ -32,6 +38,7 @@ dusty clean quick          clean the default Quick items
 dusty clean deep           every default item (admin items need an elevated console)
 dusty clean temp dev       specific items by id
 dusty sensors              five live samples
+dusty uninstall            removes the tasks and the Program Files copy (elevated console)
 ```
 
 Every clean is logged to `%LOCALAPPDATA%\dusty\clean.log`. Settings are kept in
@@ -71,8 +78,9 @@ use, and keeps each target's root folder.
   is geometry in `src/ui/logo.rs`, so the cog can turn. `res/make_icon.py` draws the same
   mark into `dusty.ico` and `logo.svg`.
 - **Privileges**: dusty runs as a normal user. Admin items run in the same exe relaunched
-  with `--helper` behind one UAC prompt per batch. The helper accepts catalogue ids only,
-  never paths.
+  with `--helper` behind a UAC prompt, or in the scheduled task once a prompt has set it
+  up. Both accept catalogue ids only, never paths. `dusty uninstall` in an elevated console
+  removes the tasks and the copy.
 - **Sampling** (one thread, 1 Hz, parked when nothing is on screen):
   - `GetSystemTimes` for CPU, matching Task Manager on current Windows 11.
   - `GlobalMemoryStatusEx` for memory.

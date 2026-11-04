@@ -2,11 +2,13 @@
 //!   dusty scan                 sizes of every item
 //!   dusty clean quick|deep|ID… clean (admin items need an elevated console)
 //!   dusty sensors              live readings, five samples
+//!   dusty uninstall            removes what dusty set up (elevated console)
 
 use std::time::Duration;
 
 use crate::clean::{self, ITEMS, Item, Tier};
 use crate::monitor::Sampler;
+use crate::settings::{self, Plan, Schedule, Settings};
 use crate::win::{fmt_bytes, is_elevated};
 
 pub fn run(args: &[String]) -> i32 {
@@ -17,12 +19,13 @@ pub fn run(args: &[String]) -> i32 {
             _ => usage(),
         },
         Some("sensors") => sensors(),
+        Some("uninstall") => uninstall(),
         _ => usage(),
     }
 }
 
 fn usage() -> i32 {
-    println!("usage: dusty [scan | clean quick|deep|<id>... | sensors]");
+    println!("usage: dusty [scan | clean quick|deep|<id>... | sensors | uninstall]");
     println!("ids: {}", ITEMS.iter().map(|i| i.id).collect::<Vec<_>>().join(", "));
     2
 }
@@ -59,6 +62,21 @@ fn report(items: &[&'static Item], delete: bool) -> i32 {
         clean::log(&results);
     }
     0
+}
+
+/// Leaves nothing running or registered, so the exe can simply be deleted.
+fn uninstall() -> i32 {
+    if !is_elevated() {
+        println!("uninstall needs an elevated console");
+        return 1;
+    }
+    let mut settings = Settings::load();
+    settings.plan.every = Schedule::Off;
+    settings.save();
+    settings::set_autostart(false);
+    let removed = clean::schedule::set(Plan::default()).and(clean::task::uninstall());
+    println!("{}", if removed.is_some() { "removed" } else { "could not remove everything" });
+    if removed.is_some() { 0 } else { 1 }
 }
 
 fn sensors() -> i32 {

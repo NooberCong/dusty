@@ -11,6 +11,9 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let code = match args.first().map(String::as_str) {
         Some("--helper") => clean::helper::serve(&args[1..]),
+        Some("--helper-task") => clean::task::serve(),
+        Some("--helper-setup") => clean::task::setup(),
+        Some("--scheduled-clean") => clean::schedule::serve(),
         Some("--tray") => ui::run(true),
         Some(_) => {
             attach_console();

@@ -138,6 +138,18 @@ pub fn exe_path() -> PathBuf {
 }
 
 /// "1.2 GB" style size with one decimal above KB.
+/// An hour on the clock, the way this PC writes times.
+pub fn fmt_hour(hour: u8) -> String {
+    use windows::Win32::Foundation::SYSTEMTIME;
+    use windows::Win32::Globalization::{GetTimeFormatEx, TIME_NOSECONDS};
+    let time = SYSTEMTIME { wHour: hour as u16, ..Default::default() };
+    let mut text = [0u16; 32];
+    let written = unsafe {
+        GetTimeFormatEx(windows::core::PCWSTR::null(), TIME_NOSECONDS, Some(&time), windows::core::PCWSTR::null(), Some(&mut text))
+    };
+    if written > 0 { from_wide(&text) } else { format!("{hour:02}:00") }
+}
+
 pub fn fmt_bytes(b: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut v = b as f64;

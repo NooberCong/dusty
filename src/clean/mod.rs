@@ -4,6 +4,8 @@
 pub mod catalog;
 mod fs;
 pub mod helper;
+pub mod schedule;
+pub mod task;
 mod volcache;
 
 use std::collections::HashSet;

@@ -544,7 +544,7 @@ impl App {
         match self.step {
             Some(i) => format!("{}…", self.rows[i].item.name),
             None if self.rows.iter().any(|r| r.pending && r.item.admin) && !self.elevated => {
-                "Waiting for administrator permission".into()
+                if self.quiet { "Starting system items…" } else { "Waiting for administrator permission" }.into()
             }
             None => "Finishing…".into(),
         }
@@ -591,26 +591,65 @@ impl App {
     // ---- Settings view ----------------------------------------------------
 
     /// A row with a picker on its right: the brass pill slides to the choice.
-    fn draw_theme_row(&mut self, c: &Canvas, res: &Res, r: R) {
+    fn draw_picker(&mut self, c: &Canvas, res: &Res, r: R, text: (&str, &str), options: &[(Hit, &str)], pick: f32) {
         const SEGMENT_W: f32 = 68.0;
         const TRACK_H: f32 = 32.0;
         let t = self.theme;
         let f = &res.fonts;
         c.line(r.x + 12.0, r.bottom() - 0.5, r.right() - 12.0, r.bottom() - 0.5, t.stroke.alpha(0.6), 1.0);
-        c.text("Theme", &f.body, R::new(r.x + 12.0, r.y + 13.0, r.w - 260.0, 20.0), t.text);
-        c.text("System follows your Windows setting", &f.cap, R::new(r.x + 12.0, r.y + 34.0, r.w - 260.0, 18.0), t.text2);
+        let track_w = options.len() as f32 * SEGMENT_W;
+        let text_w = r.w - track_w - 36.0;
+        c.text(text.0, &f.body, R::new(r.x + 12.0, r.y + 13.0, text_w, 20.0), t.text);
+        c.text(text.1, &f.cap, R::new(r.x + 12.0, r.y + 34.0, text_w, 18.0), t.text2);
 
-        let track = R::new(r.right() - 12.0 - 3.0 * SEGMENT_W, r.y + (r.h - TRACK_H) / 2.0, 3.0 * SEGMENT_W, TRACK_H);
+        let track = R::new(r.right() - 12.0 - track_w, r.y + (r.h - TRACK_H) / 2.0, track_w, TRACK_H);
         c.fill(track, 9.0, t.surface);
-        let pick = self.motion.theme_pick.value;
         let segment = |i: f32| R::new(track.x + i * SEGMENT_W, track.y, SEGMENT_W, TRACK_H);
         c.fill(segment(pick).inset(3.0, 3.0), 6.5, t.accent);
-        for (i, (mode, label)) in ThemeMode::ALL.into_iter().enumerate() {
-            let hit = Hit::Theme(mode);
+        for (i, &(hit, label)) in options.iter().enumerate() {
             let chosen = (1.0 - (pick - i as f32).abs()).clamp(0.0, 1.0);
             let ink = t.text2.mix(t.text, self.hover(hit)).mix(t.on_accent, chosen);
             c.text(label, &f.cap_c, segment(i as f32), ink);
             self.hits.push((segment(i as f32), hit));
+        }
+    }
+
+    /// A value with an arrow either side. Fades in with `open`, and only takes
+    /// clicks once it's mostly there.
+    fn draw_stepper(&mut self, c: &Canvas, res: &Res, r: R, label: &str, hits: [Hit; 2], open: f32) {
+        const ARROW_W: f32 = 34.0;
+        let t = self.theme;
+        let f = &res.fonts;
+        c.fill(r, 9.0, t.surface.alpha(open));
+        c.text(label, &f.cap_c, r, t.text.alpha(open));
+        for (hit, glyph, x) in [(hits[0], "‹", r.x), (hits[1], "›", r.right() - ARROW_W)] {
+            let arrow = R::new(x, r.y, ARROW_W, r.h);
+            c.text(glyph, &f.cap_c, arrow, t.text2.mix(t.accent, self.hover(hit)).alpha(open));
+            if open > 0.5 {
+                self.hits.push((arrow, hit));
+            }
+        }
+    }
+
+    /// The day, if the frequency has one, and the hour automatic cleaning runs.
+    fn draw_schedule_when(&mut self, c: &Canvas, res: &Res, r: R, open: f32) {
+        const TIME_W: f32 = 136.0;
+        const DAY_W: f32 = 158.0;
+        const STEPPER_H: f32 = 32.0;
+        let t = self.theme;
+        let f = &res.fonts;
+        let plan = self.settings.plan;
+        c.line(r.x + 12.0, r.bottom() - 0.5, r.right() - 12.0, r.bottom() - 0.5, t.stroke.alpha(0.6 * open), 1.0);
+        let text_w = r.w - TIME_W - DAY_W - 44.0;
+        c.text("When", &f.body, R::new(r.x + 12.0, r.y + 13.0, text_w, 20.0), t.text.alpha(open));
+        c.text("If the PC is off, it runs once it's back on", &f.cap, R::new(r.x + 12.0, r.y + 34.0, text_w, 18.0), t.text2.alpha(open));
+
+        let y = r.y + (r.h - STEPPER_H) / 2.0;
+        let time = R::new(r.right() - 12.0 - TIME_W, y, TIME_W, STEPPER_H);
+        self.draw_stepper(c, res, time, &fmt_hour(plan.hour), [Hit::ScheduleHour(-1), Hit::ScheduleHour(1)], open);
+        if let Some(day) = plan.day_label() {
+            let r = R::new(time.x - 8.0 - DAY_W, y, DAY_W, STEPPER_H);
+            self.draw_stepper(c, res, r, &day, [Hit::ScheduleDay(-1), Hit::ScheduleDay(1)], open);
         }
     }
 
@@ -621,7 +660,9 @@ impl App {
         self.title(c, res, "Settings");
 
         let mut y = 72.0;
-        self.draw_theme_row(c, res, R::new(x0 - 12.0, y, cw + 24.0, SETTING_H));
+        let themes = ThemeMode::ALL.map(|(mode, label)| (Hit::Theme(mode), label));
+        let text = ("Theme", "System follows your Windows setting");
+        self.draw_picker(c, res, R::new(x0 - 12.0, y, cw + 24.0, SETTING_H), text, &themes, self.motion.theme_pick.value);
         y += SETTING_H;
 
         let rows = [
@@ -640,6 +681,16 @@ impl App {
             toggle(c, &t, R::new(r.right() - 12.0 - 44.0, r.y + (r.h - 24.0) / 2.0, 44.0, 24.0), self.motion.toggles[i].value);
             self.hits.push((r, hit));
             y += SETTING_H;
+        }
+
+        let schedules = Schedule::ALL.map(|(schedule, label)| (Hit::Schedule(schedule), label));
+        let text = ("Automatic cleaning", "Cleans your ticked items, except the Recycle Bin");
+        self.draw_picker(c, res, R::new(x0 - 12.0, y, cw + 24.0, SETTING_H), text, &schedules, self.motion.schedule_pick.value);
+        y += SETTING_H;
+        let open = self.motion.schedule_open.value;
+        if open > 0.0 {
+            self.draw_schedule_when(c, res, R::new(x0 - 12.0, y, cw + 24.0, SETTING_H), open);
+            y += SETTING_H * open;
         }
 
         // Sensors only come up when one has never answered. A reading since
