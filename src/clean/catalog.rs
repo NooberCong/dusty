@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 
 use super::fs::Filter;
-use crate::win::env_path;
+use crate::win::{env_path, windows_dir};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tier {
@@ -182,12 +182,12 @@ fn user_temp() -> Vec<Target> {
 }
 
 fn windows_temp() -> Vec<Target> {
-    all([env_path("SystemRoot").map(|r| r.join("Temp"))], Filter::older_than_hours(7 * 24))
+    all([windows_dir().map(|r| r.join("Temp"))], Filter::older_than_hours(7 * 24))
 }
 
 fn update_downloads() -> Vec<Target> {
     all(
-        [env_path("SystemRoot").map(|r| r.join(r"SoftwareDistribution\Download"))],
+        [windows_dir().map(|r| r.join(r"SoftwareDistribution\Download"))],
         Filter::older_than_hours(10 * 24),
     )
 }
@@ -294,6 +294,15 @@ mod tests {
         ids.dedup();
         assert_eq!(ids.len(), ITEMS.len());
         assert!(ITEMS.iter().filter(|i| i.tier == Tier::Quick).all(|i| !i.admin));
+    }
+
+    /// Means most when run with %SystemRoot% pointing elsewhere.
+    #[test]
+    fn system_targets_come_from_windows_not_the_environment() {
+        let windows = windows_dir().unwrap();
+        assert!(windows.join(r"System32\kernel32.dll").exists(), "{windows:?}");
+        assert_eq!(windows_temp()[0].path, windows.join("Temp"));
+        assert_eq!(update_downloads()[0].path, windows.join(r"SoftwareDistribution\Download"));
     }
 
     #[test]

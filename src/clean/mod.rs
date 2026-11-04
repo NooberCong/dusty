@@ -24,7 +24,7 @@ use windows::core::PCWSTR;
 pub use catalog::{ITEMS, Item, Tier};
 pub use fs::Tally;
 
-use crate::win::{Handle, env_path, from_wide};
+use crate::win::{Handle, env_path, from_wide, windows_dir};
 use catalog::Action;
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -94,7 +94,8 @@ fn recycle_bin(delete: bool) -> Outcome {
 
 fn run_handlers(keys: &[&str], delete: bool) -> Outcome {
     let _com = volcache::ComScope::enter();
-    let volume = format!("{}\\", std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into()));
+    let windows = windows_dir().unwrap_or_else(|| r"C:\Windows".into());
+    let volume = windows.ancestors().last().unwrap_or(&windows).to_string_lossy().into_owned();
     let mut out = Outcome::default();
     let mut ok = 0;
     for key in keys {

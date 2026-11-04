@@ -12,7 +12,9 @@ windows-numerics = "0.3"
 [dependencies.windows]
 version = "0.62"
 features = [
+    "Wdk_Foundation",
     "Wdk_Graphics_Direct3D",
+    "Wdk_Storage_FileSystem",
     "Win32_Foundation",
     "Win32_Globalization",
     "Win32_Graphics_Direct2D",

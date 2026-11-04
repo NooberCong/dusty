@@ -4,11 +4,12 @@ use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, MAX_PATH};
 use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
 use windows::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, REG_DWORD, RRF_RT_REG_DWORD, RRF_RT_REG_SZ, RegGetValueW,
 };
+use windows::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows::core::PCWSTR;
 
@@ -131,6 +132,14 @@ pub fn system_uses_light_theme() -> bool {
 
 pub fn env_path(var: &str) -> Option<PathBuf> {
     std::env::var_os(var).filter(|v| !v.is_empty()).map(PathBuf::from)
+}
+
+/// Windows' own folder, from the system rather than %SystemRoot%: the elevated
+/// task inherits the user's environment, which their programs can change.
+pub fn windows_dir() -> Option<PathBuf> {
+    let mut buf = [0u16; MAX_PATH as usize];
+    let len = unsafe { GetSystemWindowsDirectoryW(Some(&mut buf)) } as usize;
+    (1..buf.len()).contains(&len).then(|| PathBuf::from(from_wide(&buf)))
 }
 
 pub fn exe_path() -> PathBuf {
