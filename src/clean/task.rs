@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree};
 use windows::Win32::System::TaskScheduler::{
-    ITaskFolder, ITaskService, TASK_CREATE_OR_UPDATE, TASK_LOGON_INTERACTIVE_TOKEN, TASK_STATE_RUNNING, TaskScheduler,
+    IRegisteredTask, ITaskFolder, ITaskService, TASK_CREATE_OR_UPDATE, TASK_LOGON_INTERACTIVE_TOKEN, TASK_STATE_RUNNING, TaskScheduler,
 };
 use windows::Win32::System::Variant::VARIANT;
 use windows::Win32::UI::Shell::{FOLDERID_ProgramFiles, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
@@ -26,14 +26,16 @@ use crate::win::{env_path, exe_path};
 
 const TASK: &str = "dusty system clean";
 const POLL: Duration = Duration::from_millis(150);
-/// A task that hasn't reported by now isn't going to, so the prompt takes over.
+/// A task that hasn't reported by now isn't going to.
 const START_TIMEOUT: Duration = Duration::from_secs(15);
 const DONE: &str = "done\n";
+const BUSY: &str = "another clean is running";
 
-/// What the task may touch. Items outside the system's own folders would have
-/// it working where any program can plant links, and items off by default,
+/// What the task may touch. Items in the user's own folders would have it
+/// deleting on behalf of whatever program asked, and items off by default,
 /// like the previous Windows version, are too final to delete without a
-/// prompt, though measuring them is harmless.
+/// prompt, though measuring them is harmless. Windows\Temp is in, and users
+/// can plant links there, which is why `fs` opens nothing below a root by path.
 pub fn allowed(item: &Item, delete: bool) -> bool {
     item.admin && (item.default_on || !delete)
 }
@@ -80,19 +82,37 @@ fn tasks() -> windows::core::Result<ITaskFolder> {
 
 /// Runs `ids` through the task, reporting as it goes. None means it never
 /// started and nothing was cleaned, so the caller should ask for elevation.
+/// The task runs one clean at a time, so while another is going this reports
+/// an error, and that other clean is left to finish.
 pub fn run(ids: &[&str], delete: bool, on_event: &mut impl FnMut(Event)) -> Option<io::Result<()>> {
     let (report, request) = (report_path()?, request_path()?);
     let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos();
+    let _com = ComScope::enter();
+    let task = unsafe { tasks().ok()?.GetTask(&BSTR::from(TASK)) }.ok()?;
+    if is_running(&task) {
+        return Some(Err(busy()));
+    }
     std::fs::create_dir_all(request.parent()?).ok()?;
     std::fs::write(&request, format_request(nonce, delete, ids)).ok()?;
-    let _com = ComScope::enter();
-    let result = follow(&report, nonce, on_event);
+    let result = follow(&task, &report, nonce, on_event);
     std::fs::remove_file(&request).ok();
     result
 }
 
-fn follow(report: &std::path::Path, nonce: u128, on_event: &mut impl FnMut(Event)) -> Option<io::Result<()>> {
-    let task = unsafe { tasks().ok()?.GetTask(&BSTR::from(TASK)) }.ok()?;
+fn is_running(task: &IRegisteredTask) -> bool {
+    unsafe { task.State() }.is_ok_and(|s| s == TASK_STATE_RUNNING)
+}
+
+fn busy() -> io::Error {
+    io::Error::other(BUSY)
+}
+
+fn follow(
+    task: &IRegisteredTask,
+    report: &std::path::Path,
+    nonce: u128,
+    on_event: &mut impl FnMut(Event),
+) -> Option<io::Result<()>> {
     unsafe { task.Run(&VARIANT::default()) }.ok()?;
     let header = header(nonce);
     let started = Instant::now();
@@ -100,13 +120,15 @@ fn follow(report: &std::path::Path, nonce: u128, on_event: &mut impl FnMut(Event
     loop {
         std::thread::sleep(POLL);
         // State first: if it has stopped, the report read after it is final.
-        let running = unsafe { task.State() }.is_ok_and(|s| s == TASK_STATE_RUNNING);
+        let running = is_running(task);
         let text = std::fs::read_to_string(report).unwrap_or_default();
         // Until the header matches, this is the last run's report.
         if !text.starts_with(&header) {
             if started.elapsed() > START_TIMEOUT {
-                unsafe { task.Stop(0) }.ok();
-                return None;
+                // Running without our header means it's someone else's clean,
+                // so it's never stopped. A run of ours starting after this
+                // is harmless: the caller takes the request away.
+                return if running { Some(Err(busy())) } else { None };
             }
             continue;
         }
@@ -245,6 +267,34 @@ mod tests {
     fn measuring_may_reach_items_that_cleaning_may_not() {
         let (.., items) = parse_request("1 scan temp old-windows").unwrap();
         assert_eq!(items.iter().map(|i| i.id).collect::<Vec<_>>(), ["old-windows"]);
+    }
+
+    /// Against the real task, so it needs one set up, and it only measures:
+    /// `cargo test --release second_request -- --ignored`.
+    #[test]
+    #[ignore]
+    fn a_second_request_leaves_the_running_one_alone() {
+        // Measured over and over, to outlast START_TIMEOUT as a real clean would.
+        let slow = ["updates", "drivers", "old-windows"].repeat(5);
+        let count = slow.len();
+        let first = std::thread::spawn(move || {
+            let started = Instant::now();
+            let mut finished = 0;
+            let result = run(&slow, false, &mut |event| finished += matches!(event, Event::Finished(..)) as usize);
+            (result.map(|r| r.map_err(|e| e.to_string())), finished, started.elapsed())
+        });
+        std::thread::sleep(Duration::from_secs(3));
+
+        let second = run(&["delivery"], false, &mut |_| {});
+        let refused = matches!(&second, Some(Err(e)) if e.to_string() == BUSY);
+        println!("second request: {second:?}");
+
+        let (result, finished, took) = first.join().unwrap();
+        println!("first request: {result:?}, {finished} items, took {took:?}");
+        assert!(took > START_TIMEOUT + Duration::from_secs(3), "the first run was over too soon to prove anything");
+        assert!(refused, "the second request should be told a clean is running");
+        assert_eq!(result, Some(Ok(())), "the first run must not be stopped");
+        assert_eq!(finished, count);
     }
 
     #[test]
