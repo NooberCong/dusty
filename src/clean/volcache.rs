@@ -55,9 +55,25 @@ impl Drop for RegKey {
     }
 }
 
-/// Bytes the handler reports (and frees, when `purge`). Errors mean the
+/// Bytes the handler could free, or did free when `purge`. Errors mean the
 /// handler is missing, refused (usually: not elevated) or failed.
 pub fn run(key: &str, volume: &str, purge: bool) -> Result<u64> {
+    let before = session(key, volume, purge)?;
+    if !purge || before == 0 {
+        return Ok(before);
+    }
+    Ok(freed(before, session(key, volume, false)))
+}
+
+/// A handler's figure is only what it could free, and purging can leave it
+/// unchanged, so what went is what it no longer reports. If it can't say,
+/// nothing is claimed.
+fn freed(before: u64, after: Result<u64>) -> u64 {
+    after.map_or(0, |after| before.saturating_sub(after))
+}
+
+/// One pass through a handler, returning the size it reported at the start.
+fn session(key: &str, volume: &str, purge: bool) -> Result<u64> {
     let mut hkey = HKEY::default();
     let path = wide(format!("{ROOT}{key}"));
     unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, PCWSTR(path.as_ptr()), None, KEY_READ, &mut hkey) }.ok()?;
@@ -102,4 +118,17 @@ pub fn run(key: &str, volume: &str, purge: bool) -> Result<u64> {
         .and_then(|_| if purge && used > 0 { unsafe { cache.Purge(used, &progress) } } else { Ok(()) });
     unsafe { cache.Deactivate() }.ok();
     result.map(|_| used)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_what_a_handler_stopped_reporting_counts_as_freed() {
+        assert_eq!(freed(1520, Ok(190)), 1330);
+        assert_eq!(freed(190, Ok(190)), 0);
+        assert_eq!(freed(190, Ok(400)), 0);
+        assert_eq!(freed(190, Err(windows::core::Error::empty())), 0);
+    }
 }
