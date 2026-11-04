@@ -1179,7 +1179,13 @@ CPU {:.0}% · RAM {:.0}%{gpu}", snap.cpu, snap.mem_percent()));
                     let cleaning = matches!(self.busy, Some(Phase::Clean { .. }));
                     if cleaning && !o.failed {
                         cleaned_now += o.tally.bytes;
+                        if self.settings.set_leftover(item.id, o.left) {
+                            self.settings.save();
+                        }
                     }
+                    // Offering what a clean can't remove would never stop.
+                    let hide = !cleaning && self.settings.is_leftover(item.id, o.tally.bytes);
+                    let o = if hide { Outcome { tally: Default::default(), ..o } } else { o };
                     if let Some(i) = self.rows.iter().position(|r| r.item.id == item.id) {
                         if cleaning && !o.failed && o.note.is_none() {
                             self.motion.done[i].target = 1.0;

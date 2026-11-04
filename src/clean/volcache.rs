@@ -55,21 +55,22 @@ impl Drop for RegKey {
     }
 }
 
-/// Bytes the handler could free, or did free when `purge`. Errors mean the
-/// handler is missing, refused (usually: not elevated) or failed.
-pub fn run(key: &str, volume: &str, purge: bool) -> Result<u64> {
+/// Bytes the handler could free, or when `purge`, the bytes it did free and
+/// the bytes it still reports. Errors mean the handler is missing, refused
+/// (usually: not elevated) or failed.
+pub fn run(key: &str, volume: &str, purge: bool) -> Result<(u64, u64)> {
     let before = session(key, volume, purge)?;
     if !purge || before == 0 {
-        return Ok(before);
+        return Ok((before, 0));
     }
-    Ok(freed(before, session(key, volume, false)))
+    Ok(purged(before, session(key, volume, false)))
 }
 
 /// A handler's figure is only what it could free, and purging can leave it
 /// unchanged, so what went is what it no longer reports. If it can't say,
 /// nothing is claimed.
-fn freed(before: u64, after: Result<u64>) -> u64 {
-    after.map_or(0, |after| before.saturating_sub(after))
+fn purged(before: u64, after: Result<u64>) -> (u64, u64) {
+    after.map_or((0, 0), |after| (before.saturating_sub(after), after))
 }
 
 /// One pass through a handler, returning the size it reported at the start.
@@ -126,9 +127,9 @@ mod tests {
 
     #[test]
     fn only_what_a_handler_stopped_reporting_counts_as_freed() {
-        assert_eq!(freed(1520, Ok(190)), 1330);
-        assert_eq!(freed(190, Ok(190)), 0);
-        assert_eq!(freed(190, Ok(400)), 0);
-        assert_eq!(freed(190, Err(windows::core::Error::empty())), 0);
+        assert_eq!(purged(1520, Ok(190)), (1330, 190));
+        assert_eq!(purged(190, Ok(190)), (0, 190));
+        assert_eq!(purged(190, Ok(400)), (0, 400));
+        assert_eq!(purged(190, Err(windows::core::Error::empty())), (0, 0));
     }
 }

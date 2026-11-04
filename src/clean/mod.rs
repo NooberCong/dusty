@@ -34,6 +34,8 @@ pub struct Outcome {
     pub note: Option<String>,
     /// Nothing could be measured or cleaned (missing rights, handler error).
     pub failed: bool,
+    /// What Windows still calls removable after cleaning it.
+    pub left: u64,
 }
 
 /// Measures (`delete == false`) or cleans one item in this process.
@@ -96,8 +98,9 @@ fn run_handlers(keys: &[&str], delete: bool) -> Outcome {
     let mut out = Outcome::default();
     let mut ok = 0;
     for key in keys {
-        if let Ok(bytes) = volcache::run(key, &volume, delete) {
+        if let Ok((bytes, left)) = volcache::run(key, &volume, delete) {
             out.tally.bytes += bytes;
+            out.left += left;
             ok += 1;
         }
     }

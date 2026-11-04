@@ -153,7 +153,7 @@ fn is_result_path(p: &Path) -> bool {
 
 fn finished_line(item: &catalog::Item, o: &Outcome) -> String {
     let note = o.note.as_deref().unwrap_or("").replace(['\t', '\n'], " ");
-    format!("{}\t{}\t{}\t{}\t{}\n", item.id, o.tally.files, o.tally.bytes, o.failed as u8, note)
+    format!("{}\t{}\t{}\t{}\t{}\t{}\n", item.id, o.tally.files, o.tally.bytes, o.failed as u8, o.left, note)
 }
 
 fn parse(line: &str) -> Option<Event> {
@@ -166,8 +166,9 @@ fn parse(line: &str) -> Option<Event> {
     let files = f.next()?.parse().ok()?;
     let bytes = f.next()?.parse().ok()?;
     let failed = f.next()? == "1";
+    let left = f.next()?.parse().ok()?;
     let note = f.next().filter(|n| !n.is_empty()).map(String::from);
-    Some(Event::Finished(item, Outcome { tally: Tally { files, bytes }, note, failed }))
+    Some(Event::Finished(item, Outcome { tally: Tally { files, bytes }, note, failed, left }))
 }
 
 /// Reports every complete line in `text` and returns the bytes they took up.
@@ -185,8 +186,8 @@ mod tests {
     #[test]
     fn roundtrip() {
         for o in [
-            Outcome { tally: Tally { files: 3, bytes: 99 }, note: None, failed: false },
-            Outcome { tally: Tally::default(), note: Some("Edge is open, skipped".into()), failed: true },
+            Outcome { tally: Tally { files: 3, bytes: 99 }, note: None, failed: false, left: 190 },
+            Outcome { tally: Tally::default(), note: Some("Edge is open, skipped".into()), failed: true, left: 0 },
         ] {
             let item = catalog::find("temp").unwrap();
             let line = finished_line(item, &o);
@@ -206,7 +207,7 @@ mod tests {
 
     #[test]
     fn rejects_foreign_ids_and_paths() {
-        assert!(parse("../etc\t1\t1\t0\t").is_none());
+        assert!(parse("../etc\t1\t1\t0\t0\t").is_none());
         assert!(parse("started\t../etc").is_none());
         assert!(!is_result_path(Path::new(r"C:\Windows\System32\evil.tsv")));
         assert!(!is_result_path(Path::new("dusty-1-2.tsv")));

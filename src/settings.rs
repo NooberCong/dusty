@@ -119,6 +119,8 @@ pub struct Settings {
     pub plan: Plan,
     /// Ids of the cleanup items the user has ticked.
     pub selected: Vec<String>,
+    /// Item ids and the size Windows still gave for them after a clean.
+    pub leftovers: Vec<(String, u64)>,
 }
 
 impl Default for Settings {
@@ -128,6 +130,7 @@ impl Default for Settings {
             theme: ThemeMode::default(),
             plan: Plan::default(),
             selected: ITEMS.iter().filter(|i| i.default_on).map(|i| i.id.to_string()).collect(),
+            leftovers: Vec::new(),
         }
     }
 }
@@ -153,6 +156,14 @@ impl Settings {
                 "weekday" => s.plan.weekday = in_range(v, 0, 7).unwrap_or(s.plan.weekday),
                 "month_day" => s.plan.month_day = in_range(v, 1, LAST_MONTH_DAY + 1).unwrap_or(s.plan.month_day),
                 "hour" => s.plan.hour = in_range(v, 0, 24).unwrap_or(s.plan.hour),
+                "leftovers" => {
+                    s.leftovers = v
+                        .split(',')
+                        .filter_map(|pair| pair.trim().split_once(':'))
+                        .filter(|(id, _)| ITEMS.iter().any(|i| i.id == *id))
+                        .filter_map(|(id, bytes)| Some((id.to_string(), bytes.parse().ok()?)))
+                        .collect()
+                }
                 "selected" => {
                     s.selected = v
                         .split(',')
@@ -171,10 +182,12 @@ impl Settings {
         let theme = ThemeMode::ALL[self.theme.index()].1;
         let Plan { every, weekday, month_day, hour } = self.plan;
         let schedule = Schedule::ALL[every.index()].1;
+        let leftovers: Vec<String> = self.leftovers.iter().map(|(id, bytes)| format!("{id}:{bytes}")).collect();
         format!(
-            "overlay={}\ntheme={theme}\nschedule={schedule}\nweekday={weekday}\nmonth_day={month_day}\nhour={hour}\nselected={}\n",
+            "overlay={}\ntheme={theme}\nschedule={schedule}\nweekday={weekday}\nmonth_day={month_day}\nhour={hour}\nselected={}\nleftovers={}\n",
             self.overlay as u8,
-            self.selected.join(",")
+            self.selected.join(","),
+            leftovers.join(",")
         )
     }
 
@@ -188,6 +201,22 @@ impl Settings {
 
     pub fn is_selected(&self, id: &str) -> bool {
         self.selected.iter().any(|s| s == id)
+    }
+
+    /// Whether `bytes` is just what cleaning this item already couldn't remove.
+    /// Any other size means something changed, so all of it counts again.
+    pub fn is_leftover(&self, id: &str, bytes: u64) -> bool {
+        bytes > 0 && self.leftovers.iter().any(|(i, b)| i == id && *b == bytes)
+    }
+
+    /// Remembers what a clean left behind. Returns whether that changed.
+    pub fn set_leftover(&mut self, id: &str, bytes: u64) -> bool {
+        let before = self.leftovers.clone();
+        self.leftovers.retain(|(i, _)| i != id);
+        if bytes > 0 {
+            self.leftovers.push((id.to_string(), bytes));
+        }
+        self.leftovers != before
     }
 
     pub fn set_selected(&mut self, id: &str, on: bool) {
@@ -240,7 +269,8 @@ mod tests {
     fn roundtrip_and_unknown_ids_dropped() {
         let selected = vec!["temp".into(), "dev".into()];
         let plan = Plan { every: Schedule::Weekly, weekday: 2, month_day: 15, hour: 21 };
-        let s = Settings { overlay: false, theme: ThemeMode::Dark, plan, selected };
+        let leftovers = vec![("updates".into(), 190)];
+        let s = Settings { overlay: false, theme: ThemeMode::Dark, plan, selected, leftovers };
         assert_eq!(Settings::parse(&s.serialize()), s);
         let p = Settings::parse("overlay=1\nselected=temp, bogus ,recycle\n");
         assert_eq!(p.selected, vec!["temp", "recycle"]);
@@ -285,6 +315,25 @@ mod tests {
         assert_eq!(Plan { every: Schedule::Monthly, ..plan }.day_label().unwrap(), "Day 15");
         assert_eq!(Plan { every: Schedule::Daily, ..plan }.day_label(), None);
         assert_eq!(Plan { every: Schedule::Daily, ..plan }.step_day(1), Plan { every: Schedule::Daily, ..plan });
+    }
+
+    #[test]
+    fn only_the_exact_size_a_clean_left_is_a_leftover() {
+        let mut s = Settings::default();
+        assert!(s.set_leftover("updates", 190));
+        assert!(!s.set_leftover("updates", 190));
+        assert!(s.is_leftover("updates", 190));
+        assert!(!s.is_leftover("updates", 191));
+        assert!(!s.is_leftover("delivery", 190));
+        assert!(s.set_leftover("updates", 0));
+        assert!(!s.is_leftover("updates", 190));
+        assert!(!s.is_leftover("updates", 0));
+    }
+
+    #[test]
+    fn leftovers_for_unknown_items_or_sizes_are_dropped() {
+        let s = Settings::parse("leftovers=updates:190,bogus:5,delivery:x\n");
+        assert_eq!(s.leftovers, vec![("updates".to_string(), 190)]);
     }
 
     #[test]
