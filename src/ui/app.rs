@@ -65,6 +65,7 @@ const LIST_TOP: f32 = 240.0;
 const ROW_H: f32 = 56.0;
 const SECTION_H: f32 = 38.0;
 const SECTION_GAP: f32 = 12.0;
+const LIST_PAD: f32 = 6.0;
 /// Empty space this far from the top drags the window.
 const CAPTION_H: f32 = 48.0;
 const RESIZE_EDGE: f32 = 6.0;
@@ -122,6 +123,7 @@ enum Phase {
 }
 
 enum JobMsg {
+    Started(&'static Item),
     Item(&'static Item, Outcome),
     Done { error: Option<String> },
 }
@@ -131,7 +133,7 @@ struct Row {
     checked: bool,
     /// Latest measurement; None until measured.
     size: Option<Outcome>,
-    /// Being measured or cleaned right now.
+    /// Waiting to be measured or cleaned, or being worked on.
     pending: bool,
 }
 
@@ -218,6 +220,12 @@ struct Motion {
     cheer: Ease,
     scroll: Spring,
     checks: Vec<Ease>,
+    /// Per row, 0 to 1 as its "finished" tick fades in during a clean.
+    done: Vec<Ease>,
+    /// Top of the highlight on the item being cleaned, in list DIPs.
+    step_y: Ease,
+    /// 0 to 1 as that highlight appears.
+    step_on: Ease,
     toggles: [Ease; 2],
     /// Position of the theme picker's selection, in segments.
     theme_pick: Ease,
@@ -266,6 +274,10 @@ pub struct App {
     rows: Vec<Row>,
     busy: Option<Phase>,
     job_items: usize,
+    /// Row a clean is working on right now.
+    step: Option<usize>,
+    /// Keep that row in view; the user scrolling takes over.
+    follow_step: bool,
     freed: Option<(u64, u64)>,
     last_scan: Option<Instant>,
     error: Option<String>,
@@ -325,6 +337,9 @@ pub fn create(hidden: bool) -> windows::core::Result<HWND> {
         cheer: Ease::new(0.0),
         scroll: Spring::default(),
         checks: rows.iter().map(|r| Ease::new(r.checked as u8 as f32)).collect(),
+        done: vec![Ease::new(0.0); rows.len()],
+        step_y: Ease::new(0.0),
+        step_on: Ease::new(0.0),
         toggles: [Ease::new(settings.overlay as u8 as f32), Ease::new(autostart as u8 as f32)],
         theme_pick: Ease::new(settings.theme.index() as f32),
         theme_fade: Ease::new(1.0),
@@ -364,6 +379,8 @@ pub fn create(hidden: bool) -> windows::core::Result<HWND> {
         rows,
         busy: None,
         job_items: 0,
+        step: None,
+        follow_step: false,
         freed: None,
         last_scan: None,
         error: None,
@@ -500,6 +517,7 @@ impl App {
             WM_MOUSEWHEEL => {
                 let delta = (wp.0 >> 16) as u16 as i16 as f32 / 120.0;
                 if self.tab == Tab::Clean {
+                    self.follow_step = false;
                     self.motion.scroll.target -= delta * 3.0 * 24.0;
                     self.clamp_scroll();
                     self.kick();
@@ -925,6 +943,9 @@ CPU {:.0}% · RAM {:.0}%{gpu}", snap.cpu, snap.mem_percent()));
         m.dial.target = dial;
         m.junk.target = selected as f32;
         m.footer.target = (self.tab != Tab::Clean && selected > 0) as u8 as f32;
+        if self.step.is_none() && !matches!(self.busy, Some(Phase::Clean { .. })) {
+            m.step_on.target = 0.0;
+        }
         self.kick();
     }
 
@@ -963,7 +984,9 @@ CPU {:.0}% · RAM {:.0}%{gpu}", snap.cpu, snap.mem_percent()));
         fine |= m.footer.step(dt, 0.07, 0.004);
         fine |= m.cheer.step(dt, 0.35, 0.004);
         fine |= m.scroll.step(dt, 24.0, 0.2);
-        for e in m.checks.iter_mut().chain(m.toggles.iter_mut()) {
+        fine |= m.step_y.step(dt, 0.07, 0.1);
+        fine |= m.step_on.step(dt, 0.07, 0.004);
+        for e in m.checks.iter_mut().chain(m.toggles.iter_mut()).chain(m.done.iter_mut()) {
             fine |= e.step(dt, 0.05, 0.004);
         }
         fine |= m.theme_pick.step(dt, 0.05, 0.003);
@@ -1038,7 +1061,12 @@ CPU {:.0}% · RAM {:.0}%{gpu}", snap.cpu, snap.mem_percent()));
         self.busy = Some(phase);
         self.job_items = items.len();
         self.error = None;
-        if !matches!(phase, Phase::Clean { .. }) {
+        if matches!(phase, Phase::Clean { .. }) {
+            self.follow_step = true;
+            for e in &mut self.motion.done {
+                e.snap(0.0);
+            }
+        } else {
             self.freed = None;
         }
         let tx = self.jobs.0.clone();
@@ -1052,6 +1080,8 @@ CPU {:.0}% · RAM {:.0}%{gpu}", snap.cpu, snap.mem_percent()));
             let (local, admin): (Vec<_>, Vec<_>) = items.into_iter().partition(|i| !i.admin || elevated);
             let mut cleaned = Vec::new();
             for item in local {
+                tx.send(JobMsg::Started(item)).ok();
+                post();
                 let o = clean::run(item, delete);
                 if delete {
                     cleaned.push((item, o.clone()));
@@ -1065,12 +1095,16 @@ CPU {:.0}% · RAM {:.0}%{gpu}", snap.cpu, snap.mem_percent()));
             let mut error = None;
             if !admin.is_empty() {
                 let ids: Vec<&str> = admin.iter().map(|i| i.id).collect();
-                match helper::run_elevated(&ids, delete) {
-                    Ok(results) => {
-                        for (item, o) in results {
-                            tx.send(JobMsg::Item(item, o)).ok();
-                        }
-                    }
+                let report = |event| {
+                    tx.send(match event {
+                        helper::Event::Started(item) => JobMsg::Started(item),
+                        helper::Event::Finished(item, o) => JobMsg::Item(item, o),
+                    })
+                    .ok();
+                    post();
+                };
+                match helper::run_elevated(&ids, delete, report) {
+                    Ok(()) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
                         error = Some("System items skipped: administrator permission was declined".into())
                     }
@@ -1089,12 +1123,20 @@ CPU {:.0}% · RAM {:.0}%{gpu}", snap.cpu, snap.mem_percent()));
         let mut cleaned_now = 0u64;
         while let Ok(msg) = self.jobs.1.try_recv() {
             match msg {
+                JobMsg::Started(item) => self.start_step(item),
                 JobMsg::Item(item, o) => {
                     let cleaning = matches!(self.busy, Some(Phase::Clean { .. }));
                     if cleaning && !o.failed {
                         cleaned_now += o.tally.bytes;
                     }
-                    if let Some(r) = self.rows.iter_mut().find(|r| r.item.id == item.id) {
+                    if let Some(i) = self.rows.iter().position(|r| r.item.id == item.id) {
+                        if cleaning && !o.failed && o.note.is_none() {
+                            self.motion.done[i].target = 1.0;
+                        }
+                        if self.step == Some(i) {
+                            self.step = None;
+                        }
+                        let r = &mut self.rows[i];
                         r.pending = false;
                         // After a clean the item is (nearly) empty; keep any note.
                         r.size = Some(if cleaning && !o.failed { Outcome { tally: Default::default(), ..o } } else { o });
@@ -1111,6 +1153,10 @@ CPU {:.0}% · RAM {:.0}%{gpu}", snap.cpu, snap.mem_percent()));
             let phase = self.busy.take();
             for r in &mut self.rows {
                 r.pending = false;
+            }
+            self.step = None;
+            for e in &mut self.motion.done {
+                e.target = 0.0;
             }
             self.error = error;
             match phase {
@@ -1136,6 +1182,38 @@ CPU {:.0}% · RAM {:.0}%{gpu}", snap.cpu, snap.mem_percent()));
         }
         self.retarget();
         self.invalidate();
+    }
+
+    /// Slides the highlight to the item a clean has moved on to, bringing it
+    /// into view if the list needs to scroll.
+    fn start_step(&mut self, item: &'static Item) {
+        let Some(i) = self.rows.iter().position(|r| r.item.id == item.id) else { return };
+        if !matches!(self.busy, Some(Phase::Clean { .. })) {
+            return;
+        }
+        self.step = Some(i);
+        let y = self.row_offset(i);
+        let m = &mut self.motion;
+        if m.step_on.target == 0.0 {
+            m.step_y.snap(y);
+        }
+        m.step_y.target = y;
+        m.step_on.target = 1.0;
+        let visible = self.size_dip().1 - LIST_TOP;
+        let scroll = self.motion.scroll.target;
+        if self.follow_step && (y < scroll || y + ROW_H > scroll + visible) {
+            self.motion.scroll.target = y - (visible - ROW_H) / 2.0;
+            self.clamp_scroll();
+        }
+    }
+
+    /// Top of a row within the list, which is grouped Quick then Deep.
+    fn row_offset(&self, i: usize) -> f32 {
+        let tier = self.rows[i].item.tier;
+        let before = self.rows[..i].iter().filter(|r| r.item.tier == tier).count();
+        let quick = self.rows.iter().filter(|r| r.item.tier == Tier::Quick).count();
+        let section = if tier == Tier::Quick { 0.0 } else { quick as f32 * ROW_H + SECTION_H + SECTION_GAP };
+        LIST_PAD + section + SECTION_H + before as f32 * ROW_H
     }
 
     fn clamp_scroll(&mut self) {

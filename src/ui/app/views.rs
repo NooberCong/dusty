@@ -100,6 +100,17 @@ fn comet(c: &Canvas, center: (f32, f32), r: f32, degrees: f32, color: Rgba) {
     }
 }
 
+/// Small ring of ticks turning in place: the row being worked on.
+fn spinner(c: &Canvas, center: (f32, f32), r: f32, degrees: f32, color: Rgba) {
+    const SPOKES: usize = 12;
+    let head = (degrees / 360.0 * SPOKES as f32) as usize;
+    for j in 0..SPOKES {
+        let i = (head + SPOKES - j) % SPOKES;
+        let angle = i as f32 / SPOKES as f32 * TAU;
+        c.tick(center, angle, (r * 0.55, r), color.alpha(1.0 - j as f32 / SPOKES as f32), 1.6);
+    }
+}
+
 /// Straight version of the dial's track, for drive space.
 fn meter(c: &Canvas, t: &Theme, r: R, value: f32, color: Rgba) {
     let count = (r.w / 6.0) as usize;
@@ -400,9 +411,13 @@ impl App {
             comet(c, center, r, self.motion.turn.value, t.accent_hi);
         }
         let scanning = self.busy == Some(Phase::Scan) && self.last_scan.is_none();
-        let number = if scanning { "–".to_string() } else { fmt_bytes(self.motion.junk.value as u64) };
+        let (number, caption) = match self.clean_progress() {
+            Some((done, total)) => (format!("{done} of {total}"), "items done"),
+            None if scanning => ("–".to_string(), "selected"),
+            None => (fmt_bytes(self.motion.junk.value as u64), "selected"),
+        };
         c.text(&number, &f.hero, R::new(center.0 - 62.0, center.1 - 26.0, 124.0, 40.0), t.text);
-        c.text("selected", &f.cap_c, R::new(center.0 - 60.0, center.1 + 12.0, 120.0, 18.0), t.text2);
+        c.text(caption, &f.cap_c, R::new(center.0 - 60.0, center.1 + 12.0, 120.0, 18.0), t.text2);
 
         let tx = x0 + CLEAN_DIAL + 32.0;
         let tw = cw - CLEAN_DIAL - 32.0;
@@ -434,7 +449,13 @@ impl App {
         let view = R::new(SIDE, LIST_TOP, w - SIDE, h - LIST_TOP);
         let mut hits = Vec::new();
         c.clip(view, || {
-            let mut y = LIST_TOP + 6.0 - scroll;
+            let on = self.motion.step_on.value;
+            if on > 0.0 {
+                let r = R::new(x0 - 12.0, LIST_TOP + self.motion.step_y.value - scroll, cw + 24.0, ROW_H);
+                c.fill(r.inset(0.0, 1.0), 9.0, t.surface.alpha(on));
+                c.fill(R::new(r.x, r.y + 15.0, 3.0, ROW_H - 30.0), 1.5, t.accent.alpha(on));
+            }
+            let mut y = LIST_TOP + LIST_PAD - scroll;
             for tier in [Tier::Quick, Tier::Deep] {
                 let label = if tier == Tier::Quick { "Quick" } else { "Deep" };
                 c.text(label, &f.cap_b, R::new(x0, y, 200.0, SECTION_H - 6.0), t.text);
@@ -509,14 +530,21 @@ impl App {
         }
     }
 
-    /// What a running clean is doing: the in-process item, or the elevated
-    /// batch, where Windows' own component cleanup can take many minutes.
+    /// Items finished and items in all, while a clean runs.
+    fn clean_progress(&self) -> Option<(usize, usize)> {
+        matches!(self.busy, Some(Phase::Clean { .. })).then(|| {
+            let waiting = self.rows.iter().filter(|r| r.pending).count();
+            (self.job_items - waiting.min(self.job_items), self.job_items)
+        })
+    }
+
+    /// What a running clean is doing. With no current item, either the
+    /// elevated helper hasn't started or the last item has just finished.
     fn cleaning_step(&self) -> String {
-        let pending = || self.rows.iter().filter(|r| r.pending);
-        match pending().find(|r| !r.item.admin || self.elevated) {
-            Some(r) => format!("{}…", r.item.name),
-            None if pending().any(|r| r.item.tier == Tier::Deep) => {
-                "Windows is cleaning system items, this can take several minutes".into()
+        match self.step {
+            Some(i) => format!("{}…", self.rows[i].item.name),
+            None if self.rows.iter().any(|r| r.pending && r.item.admin) && !self.elevated => {
+                "Waiting for administrator permission".into()
             }
             None => "Finishing…".into(),
         }
@@ -540,6 +568,16 @@ impl App {
             None => (row.item.detail, t.text2),
         };
         c.text(detail, &f.cap, R::new(text_x, r.y + 29.0, text_w, 17.0), color);
+        let size_box = R::new(r.right() - 12.0 - size_w, r.y, size_w, r.h);
+        if self.step == Some(i) {
+            spinner(c, (size_box.right() - 9.0, r.y + r.h / 2.0), 9.0, self.motion.turn.value, t.accent);
+            return;
+        }
+        let done = self.motion.done[i].value;
+        if done > 0.0 {
+            c.check(R::new(size_box.right() - 20.0, r.y + (r.h - 20.0) / 2.0, 20.0, 20.0), t.good.alpha(done), 1.8);
+            return;
+        }
         let (size, color, font) = match (&row.size, row.pending) {
             (_, true) => ("…".to_string(), t.text3, &f.number_r),
             (Some(o), _) if o.failed => ("Unavailable".to_string(), t.text3, &f.cap_r),
@@ -547,7 +585,7 @@ impl App {
             (None, _) if row.item.admin && !self.elevated => ("Needs admin".to_string(), t.text3, &f.cap_r),
             (None, _) => ("–".to_string(), t.text3, &f.number_r),
         };
-        c.text(&size, font, R::new(r.right() - 12.0 - size_w, r.y, size_w, r.h), color);
+        c.text(&size, font, size_box, color);
     }
 
     // ---- Settings view ----------------------------------------------------
