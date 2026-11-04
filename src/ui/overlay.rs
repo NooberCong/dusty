@@ -25,11 +25,11 @@ use windows::Win32::UI::Shell::{
     SHAppBarMessage, SHQueryUserNotificationState,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, EVENT_SYSTEM_FOREGROUND, FindWindowExW, FindWindowW, GW_OWNER,
-    GetWindow, GetWindowRect, HWND_TOPMOST, IDC_ARROW, IsWindowVisible, LoadCursorW, MA_NOACTIVATE, PostMessageW,
-    RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
-    SetWindowPos, ShowWindow, ULW_ALPHA, UpdateLayeredWindow, WINEVENT_OUTOFCONTEXT, WM_LBUTTONUP, WM_MOUSEACTIVATE,
-    WM_RBUTTONUP, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, EVENT_OBJECT_REORDER, FindWindowExW, FindWindowW, GW_HWNDPREV,
+    GetDesktopWindow, GetWindow, GetWindowRect, HWND_TOPMOST, IDC_ARROW, IsWindowVisible, LoadCursorW, MA_NOACTIVATE,
+    PostMessageW, RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
+    SWP_NOSIZE, SetWindowPos, ShowWindow, ULW_ALPHA, UpdateLayeredWindow, WINEVENT_OUTOFCONTEXT, WM_LBUTTONUP,
+    WM_MOUSEACTIVATE, WM_RBUTTONUP, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::{PCWSTR, w};
 
@@ -46,6 +46,9 @@ const EDGE_DIP: f32 = 12.0;
 const WIDGETS_DIP: f32 = 190.0;
 
 static OVERLAY: AtomicIsize = AtomicIsize::new(0);
+/// The main window, told about clicks. Not the readout's owner: Windows hides
+/// owned windows while their owner is minimized.
+static MAIN: AtomicIsize = AtomicIsize::new(0);
 
 pub struct Overlay {
     hwnd: HWND,
@@ -157,7 +160,7 @@ struct Run {
 }
 
 impl Overlay {
-    pub fn create(owner: HWND) -> Option<Self> {
+    pub fn create(main: HWND) -> Option<Self> {
         unsafe {
             let instance = GetModuleHandleW(None).ok()?;
             let wc = WNDCLASSW {
@@ -177,19 +180,22 @@ impl Overlay {
                 0,
                 0,
                 0,
-                Some(owner),
+                None,
                 None,
                 Some(instance.into()),
                 None,
             )
             .ok()?;
             OVERLAY.store(hwnd.0 as isize, Ordering::Release);
-            // Clicking the taskbar raises it above us; put the readout back on top.
+            MAIN.store(main.0 as isize, Ordering::Release);
+            // Clicking the taskbar raises it above us; put the readout back on
+            // top. Focus changes can land just before that move, so watch the
+            // stacking order itself.
             let hook = SetWinEventHook(
-                EVENT_SYSTEM_FOREGROUND,
-                EVENT_SYSTEM_FOREGROUND,
+                EVENT_OBJECT_REORDER,
+                EVENT_OBJECT_REORDER,
                 None,
-                Some(on_foreground),
+                Some(on_reorder),
                 0,
                 0,
                 WINEVENT_OUTOFCONTEXT,
@@ -412,13 +418,31 @@ fn raise(hwnd: HWND) {
     }
 }
 
-unsafe extern "system" fn on_foreground(_: HWINEVENTHOOK, _: u32, _: HWND, _: i32, _: i32, _: u32, _: u32) {
-    let h = OVERLAY.load(Ordering::Acquire);
-    if h != 0 {
-        let hwnd = HWND(h as _);
-        if unsafe { IsWindowVisible(hwnd) }.as_bool() {
-            raise(hwnd);
+/// Whether the taskbar sits above `hwnd`. Only the few topmost windows ahead
+/// of the readout are walked; the bound guards against the list changing mid-walk.
+fn under_taskbar(hwnd: HWND) -> bool {
+    let Ok(taskbar) = (unsafe { FindWindowW(w!("Shell_TrayWnd"), PCWSTR::null()) }) else { return false };
+    let mut above = hwnd;
+    for _ in 0..256 {
+        match unsafe { GetWindow(above, GW_HWNDPREV) } {
+            Ok(h) if h == taskbar => return true,
+            Ok(h) => above = h,
+            Err(_) => return false,
         }
+    }
+    false
+}
+
+unsafe extern "system" fn on_reorder(_: HWINEVENTHOOK, _: u32, source: HWND, _: i32, _: i32, _: u32, _: u32) {
+    let h = OVERLAY.load(Ordering::Acquire);
+    if h == 0 || source != unsafe { GetDesktopWindow() } {
+        return;
+    }
+    let hwnd = HWND(h as _);
+    // Raising is itself a reorder, so only answer the taskbar: that ends here,
+    // and never turns into a fight with another always-on-top app.
+    if unsafe { IsWindowVisible(hwnd) }.as_bool() && under_taskbar(hwnd) {
+        raise(hwnd);
     }
 }
 
@@ -426,10 +450,9 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
     match msg {
         WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
         WM_LBUTTONUP | WM_RBUTTONUP => {
-            if let Ok(owner) = unsafe { GetWindow(hwnd, GW_OWNER) } {
-                let m = if msg == WM_LBUTTONUP { WM_APP_SHOW } else { WM_APP_MENU };
-                unsafe { PostMessageW(Some(owner), m, WPARAM(0), LPARAM(0)) }.ok();
-            }
+            let main = HWND(MAIN.load(Ordering::Acquire) as _);
+            let m = if msg == WM_LBUTTONUP { WM_APP_SHOW } else { WM_APP_MENU };
+            unsafe { PostMessageW(Some(main), m, WPARAM(0), LPARAM(0)) }.ok();
             LRESULT(0)
         }
         _ => unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
